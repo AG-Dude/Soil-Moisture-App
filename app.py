@@ -1,7 +1,7 @@
 
 import streamlit as st
 from datetime import date
-import leafmap.foliumap as leafmap
+import leafmap.streamlitmap as leafmap
 import planetary_computer
 import pystac_client
 import stackstac
