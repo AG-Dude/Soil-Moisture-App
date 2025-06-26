@@ -1,11 +1,9 @@
-
 import streamlit as st
 from datetime import date
-import leafmap.streamlitmap as leafmap
+import leafmap
 import planetary_computer
 import pystac_client
 import stackstac
-import geopandas as gpd
 import shapely.geometry
 import xarray as xr
 import matplotlib.pyplot as plt
@@ -21,14 +19,12 @@ end_date = st.sidebar.date_input("End Date", date(2024, 6, 30))
 st.sidebar.markdown("Draw your Area of Interest on the map")
 
 # Interactive map
-m = leafmap.Map(center=[37.5, -120.7], zoom=10, draw_export=True)
-m.add_draw_control()
+m = leafmap.Map(draw_control=True, measure_control=False)
 m.to_streamlit(height=500)
 
 # Run button
 if st.sidebar.button("🚀 Run Analysis"):
     try:
-        # Load drawn geometry
         geojson = m.user_roi_geojson
         if not geojson:
             st.error("Please draw a rectangle on the map.")
@@ -36,7 +32,6 @@ if st.sidebar.button("🚀 Run Analysis"):
             shape = shapely.geometry.shape(geojson["features"][0]["geometry"])
             bounds = shape.bounds
 
-            # Query Sentinel-2
             catalog = pystac_client.Client.open("https://planetarycomputer.microsoft.com/api/stac/v1")
             s2_search = catalog.search(
                 collections=["sentinel-2-l2a"],
@@ -46,20 +41,19 @@ if st.sidebar.button("🚀 Run Analysis"):
             )
             s2_items = list(s2_search.get_all_items())
             if not s2_items:
-                st.warning("No Sentinel-2 imagery found for your selection.")
+                st.warning("No Sentinel-2 imagery found.")
             else:
                 s2_items = [planetary_computer.sign(item) for item in s2_items]
                 s2_data = stackstac.stack(s2_items, assets=["B04", "B08", "B11", "B03"], resolution=10)
                 s2_data = s2_data.sel(band=["B04", "B08", "B11", "B03"]).mean(dim="time")
+
                 red = s2_data.sel(band="B04")
                 nir = s2_data.sel(band="B08")
                 swir = s2_data.sel(band="B11")
-                green = s2_data.sel(band="B03")
 
                 ndvi = (nir - red) / (nir + red)
                 ndwi = (nir - swir) / (nir + swir)
 
-                # Query Sentinel-1
                 s1_search = catalog.search(
                     collections=["sentinel-1-grd"],
                     bbox=bounds,
@@ -76,7 +70,6 @@ if st.sidebar.button("🚀 Run Analysis"):
 
                 soil_moisture_proxy = (ndwi + s1_vv) / 2
 
-                # Display results
                 fig, axes = plt.subplots(1, 3, figsize=(18, 6))
                 ndvi.plot(ax=axes[0], cmap="YlGn", vmin=0, vmax=1)
                 axes[0].set_title("NDVI")
@@ -88,3 +81,4 @@ if st.sidebar.button("🚀 Run Analysis"):
 
     except Exception as e:
         st.error(f"Error: {str(e)}")
+
