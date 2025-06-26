@@ -1,5 +1,7 @@
 streamlit
 leafmap
+folium
+branca
 planetary-computer
 pystac-client
 stackstac
