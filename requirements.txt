@@ -1,0 +1,7 @@
+streamlit
+leafmap>=0.26.0
+geopandas
+rasterio
+pandas
+numpy
+matplotlib
