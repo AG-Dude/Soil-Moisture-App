@@ -1,5 +1,5 @@
-streamlit
-leafmap>=0.26.0
+streamlit==1.35.0
+leafmap==0.27.0
 geopandas
 rasterio
 pandas
