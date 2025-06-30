@@ -1,21 +1,28 @@
+# --- app.py with AOI Analysis, Offline GPT Fallback, Loading Spinner, and Time Series Chart ---
+
 import os
 import json
-import streamlit as st
-import leafmap.foliumap as leafmap
-import ee
-import openai
 import pandas as pd
 import requests
-from datetime import datetime, timedelta
 import altair as alt
+from datetime import datetime, timedelta
+
+try:
+    import streamlit as st
+    import leafmap.foliumap as leafmap
+    import ee
+    import openai
+    from openai.error import RateLimitError, ServiceUnavailableError
+except ModuleNotFoundError as e:
+    raise ModuleNotFoundError(f"Required module missing: {e.name}. Ensure all dependencies are installed, e.g., `pip install streamlit leafmap earthengine-api openai`.")
 
 st.set_page_config(layout="wide")
-st.title("🛰️ Soil Moisture, NDVI & Soil Explorer")
+st.title("🛰️ Soil Moisture, NDVI, AOI & Soil Explorer")
 
-# --- Authenticate Earth Engine ---
+# --- Environment Setup ---
 gee_key = os.getenv("EE_PRIVATE_KEY")
 if not gee_key:
-    st.error("EE_PRIVATE_KEY not found in environment.")
+    st.error("EE_PRIVATE_KEY not found. Set in Render environment variables.")
     st.stop()
 
 try:
@@ -29,9 +36,8 @@ except Exception as e:
     st.error(f"Earth Engine initialization error: {e}")
     st.stop()
 
-# --- OpenAI Setup ---
 openai.api_key = os.getenv("OPENAI_API_KEY")
-use_ai = openai.api_key is not None
+use_ai = openai.api_key is not None and len(openai.api_key) > 10
 
 # --- Dates ---
 today = datetime.utcnow().date()
@@ -39,195 +45,121 @@ start_10 = today - timedelta(days=10)
 start_30 = today - timedelta(days=30)
 
 # --- Map ---
-m = leafmap.Map(center=(37.5, -120.8), zoom=10)
+m = leafmap.Map(draw_control=True, measure_control=True)
 if "clicked" not in st.session_state:
     st.session_state.clicked = None
+if "aoi" not in st.session_state:
+    st.session_state.aoi = None
 
-def handle_click(**kwargs):
-    if "latlng" in kwargs:
-        st.session_state.clicked = kwargs["latlng"]
-        st.info(f"📍 Clicked at: {kwargs['latlng']}")
-
-m.on_click(handle_click)
-
-# --- Optional: Overlay NDVI and SAR layers ---
-with st.sidebar:
-    st.subheader("🗺️ Map Layers")
-    show_ndvi = st.checkbox("Show NDVI overlay", value=True)
-    show_sar = st.checkbox("Show SAR VV overlay", value=False)
-
-if show_ndvi:
-    ndvi_layer = ee.ImageCollection("COPERNICUS/S2") \
-        .filterDate(str(start_10), str(today)) \
-        .median().normalizedDifference(["B8", "B4"])
-    vis = {"min": 0, "max": 1, "palette": ["white", "green"]}
-    m.add_ee_layer(ndvi_layer, vis, "NDVI")
-
-if show_sar:
-    sar_layer = ee.ImageCollection("COPERNICUS/S1_GRD") \
-        .filterDate(str(start_10), str(today)) \
-        .filter(ee.Filter.eq("instrumentMode", "IW")) \
-        .filter(ee.Filter.listContains("transmitterReceiverPolarisation", "VV")) \
-        .select("VV") \
-        .mean()
-    vis = {"min": -25, "max": 0, "palette": ["purple", "blue", "white"]}
-    m.add_ee_layer(sar_layer, vis, "SAR VV")
-
-m.to_streamlit(height=700)
-
-# --- Data on Click ---
-if st.session_state.clicked:
-    lat, lon = st.session_state.clicked
-    point = ee.Geometry.Point([lon, lat])
-
-    # NDVI/SAR single values
+@st.cache_data(show_spinner=False)
+def extract_polygon_data(geom):
     try:
-        ndvi_img = ee.ImageCollection("COPERNICUS/S2") \
-            .filterBounds(point).filterDate(str(start_10), str(today)) \
-            .median().normalizedDifference(["B8", "B4"])
-        ndvi_val = ndvi_img.reduceRegion(ee.Reducer.mean(), point, 10).getInfo().get("nd")
-    except:
-        ndvi_val = None
+        point = ee.Geometry(geom['geometry'])
+        img = ee.ImageCollection("COPERNICUS/S2").filterDate(str(start_10), str(today)).median()
+        ndvi = img.normalizedDifference(["B8", "B4"]).rename("NDVI")
 
-    try:
-        sar_img = ee.ImageCollection("COPERNICUS/S1_GRD") \
-            .filterBounds(point).filterDate(str(start_10), str(today)) \
+        s1 = ee.ImageCollection("COPERNICUS/S1_GRD").filterDate(str(start_10), str(today)) \
             .filter(ee.Filter.eq("instrumentMode", "IW")) \
             .filter(ee.Filter.listContains("transmitterReceiverPolarisation", "VV")) \
-            .select("VV").mean()
-        sar_val = sar_img.reduceRegion(ee.Reducer.mean(), point, 10).getInfo().get("VV")
-    except:
-        sar_val = None
+            .select("VV").mean().rename("SAR_VV")
 
-    # SoilGrids
-    try:
-        sg_url = f"https://rest.soilgrids.org/query?lon={lon}&lat={lat}"
-        sg = requests.get(sg_url).json()
-        layers = sg['properties']['layers']
-        ph = layers['phh2o']['depths'][0]['values']['mean']
-        carbon = layers['ocd']['depths'][0]['values']['mean']
-        sand = layers['sand']['depths'][0]['values']['mean']
-        silt = layers['silt']['depths'][0]['values']['mean']
-        clay = layers['clay']['depths'][0]['values']['mean']
-    except:
-        ph = carbon = sand = silt = clay = None
+        composite = ndvi.addBands(s1)
+        mean = composite.reduceRegion(reducer=ee.Reducer.mean(), geometry=point, scale=10, bestEffort=True).getInfo()
+        return mean
+    except Exception as e:
+        st.error(f"AOI extraction error: {e}")
+        return {}
 
-    # SSURGO
-    try:
-        sw_url = f"https://casoilresource.lawr.ucdavis.edu/soilweb/rest/soils?lon={lon}&lat={lat}"
-        r = requests.get(sw_url).json()
-        comp = r['soil']['components'][0]
-        ssurgo_series = comp.get("compname")
-        ssurgo_drainage = comp.get("drainagecl")
-        ssurgo_taxorder = comp.get("taxorder")
-        map_unit_name = r['soil'].get("muname")
-        map_unit_symbol = r['soil'].get("musym")
-    except:
-        ssurgo_series = ssurgo_drainage = ssurgo_taxorder = map_unit_name = map_unit_symbol = None
+m.on_click(lambda **kwargs: st.session_state.update({"clicked": kwargs.get("latlng")}))
+m.on_draw(lambda action, geo_json: st.session_state.update({"aoi": geo_json}))
 
-    # Infiltration
-    try:
-        if clay and sand and carbon:
-            if clay > 40 or sand < 30:
-                infiltration = "Low" if carbon < 10 else "Medium"
-            elif sand > 60 and carbon > 10:
-                infiltration = "High"
-            else:
-                infiltration = "Medium"
-        else:
-            infiltration = "Unknown"
-    except:
-        infiltration = "Unknown"
+st.subheader("🌍 Interactive Map")
+with st.spinner("Loading map..."):
+    m.to_streamlit(height=600)
 
-    # Display Summary
-    st.subheader("🧪 Data at Point")
-    st.write({
-        "Latitude": lat,
-        "Longitude": lon,
-        "NDVI": ndvi_val,
-        "SAR VV": sar_val,
-        "pH": ph,
-        "Organic C (g/kg)": carbon,
-        "Sand %": sand,
-        "Silt %": silt,
-        "Clay %": clay,
-        "Infiltration Class": infiltration,
-        "SSURGO Series": ssurgo_series,
-        "Drainage": ssurgo_drainage,
-        "Tax Order": ssurgo_taxorder,
-        "Map Unit": map_unit_name,
-        "Map Symbol": map_unit_symbol
-    })
+# --- AOI Analysis ---
+if st.session_state.aoi:
+    with st.spinner("Analyzing AOI..."):
+        data = extract_polygon_data(st.session_state.aoi)
+        if data:
+            st.success("AOI analysis complete")
+            st.write(data)
+            df = pd.DataFrame([data])
+            st.download_button("📥 Download AOI CSV", df.to_csv(index=False), file_name="aoi_analysis.csv")
 
-    # Download CSV
-    df = pd.DataFrame([{
-        "Latitude": lat, "Longitude": lon, "NDVI": ndvi_val, "SAR_VV": sar_val,
-        "pH": ph, "OC_gkg": carbon, "Sand": sand, "Silt": silt, "Clay": clay,
-        "Infiltration": infiltration, "SSURGO_Series": ssurgo_series,
-        "Drainage": ssurgo_drainage, "TaxOrder": ssurgo_taxorder,
-        "MapUnit": map_unit_name, "MapSymbol": map_unit_symbol
-    }])
-    st.download_button("📥 Download CSV Report", df.to_csv(index=False), file_name="soil_data_report.csv")
+# --- Click-Based Data ---
+if st.session_state.clicked:
+    with st.spinner("Getting satellite + soil data..."):
+        lat, lon = st.session_state.clicked
+        point = ee.Geometry.Point([lon, lat])
 
-    # --- Time Series Chart (NDVI + SAR) ---
-    st.subheader("📈 NDVI & SAR Time Series (30 Days)")
+        try:
+            ndvi_collection = ee.ImageCollection("COPERNICUS/S2").filterBounds(point).filterDate(str(start_30), str(today))
+            ndvi_series = ndvi_collection.map(lambda img: img.set('date', img.date().format()).normalizedDifference(["B8", "B4"]).rename("NDVI"))
+            chart_data = ndvi_series.map(lambda img: ee.Feature(None, {"NDVI": img.reduceRegion(ee.Reducer.mean(), point, 10).get("NDVI"), "date": img.get("date")})).flatten().getInfo()
+            chart_df = pd.DataFrame([f['properties'] for f in chart_data])
+            chart_df['date'] = pd.to_datetime(chart_df['date'])
+            st.altair_chart(alt.Chart(chart_df).mark_line().encode(x='date:T', y='NDVI:Q').properties(title="NDVI Time Series"), use_container_width=True)
+        except Exception as e:
+            st.warning(f"Could not generate NDVI time series: {e}")
 
-    def extract_series(collection, band):
-        ic = collection.filterBounds(point).filterDate(str(start_30), str(today)) \
-            .sort("system:time_start").select(band)
-        dates, values = [], []
-        for img in ic.toList(ic.size()).getInfo():
-            t = datetime.utcfromtimestamp(img['properties']['system:time_start'] / 1000).date()
-            v = img['properties'].get('system:index', None)
-            geom = ee.Image(img['id']).reduceRegion(ee.Reducer.mean(), point, 10).getInfo()
-            val = geom.get(band) if geom else None
-            if val is not None:
-                dates.append(str(t))
-                values.append(val)
-        return pd.DataFrame({"Date": dates, band: values})
+        try:
+            ndvi_img = ndvi_collection.median()
+            ndvi = ndvi_img.normalizedDifference(["B8", "B4"]).reduceRegion(ee.Reducer.mean(), point, 10).getInfo()
+        except Exception:
+            ndvi = {"nd": None}
 
-    try:
-        ndvi_series = extract_series(
-            ee.ImageCollection("COPERNICUS/S2").map(lambda img: img.normalizedDifference(["B8", "B4"]).rename("NDVI")),
-            "NDVI"
-        )
-        sar_series = extract_series(
-            ee.ImageCollection("COPERNICUS/S1_GRD") \
+        try:
+            sar_img = ee.ImageCollection("COPERNICUS/S1_GRD") \
+                .filterBounds(point).filterDate(str(start_10), str(today)) \
                 .filter(ee.Filter.eq("instrumentMode", "IW")) \
                 .filter(ee.Filter.listContains("transmitterReceiverPolarisation", "VV")) \
-                .select("VV"),
-            "VV"
-        )
+                .select("VV").mean()
+            sar = sar_img.reduceRegion(ee.Reducer.mean(), point, 10).getInfo()
+        except Exception:
+            sar = {"VV": None}
 
-        chart = alt.Chart(pd.merge(ndvi_series, sar_series, on="Date", how="outer").dropna()).transform_fold(
-            ["NDVI", "VV"], as_=["Type", "Value"]
-        ).mark_line().encode(
-            x="Date:T", y="Value:Q", color="Type:N"
-        ).properties(height=300)
-        st.altair_chart(chart, use_container_width=True)
-    except:
-        st.warning("⚠️ Time series data could not be retrieved.")
+        try:
+            sg_url = f"https://rest.soilgrids.org/query?lon={lon}&lat={lat}"
+            resp = requests.get(sg_url)
+            resp.raise_for_status()
+            sg = resp.json()
+            clay = sg['properties']['layers']['clay']['depths'][0]['values']['mean']
+            silt = sg['properties']['layers']['silt']['depths'][0]['values']['mean']
+            sand = sg['properties']['layers']['sand']['depths'][0]['values']['mean']
+        except Exception:
+            clay = silt = sand = None
 
-    # --- AI Assistant ---
-    if use_ai:
+        st.write({
+            "Latitude": lat, "Longitude": lon,
+            "NDVI": ndvi.get("nd"),
+            "SAR VV": sar.get("VV"),
+            "Clay %": clay, "Silt %": silt, "Sand %": sand
+        })
+
+        # --- Fallback AI ---
         st.sidebar.header("💬 Ask the AI")
-        question = st.sidebar.text_area("Ask about this data:")
-        if st.sidebar.button("Ask") and question.strip():
-            prompt = f"""
-NDVI: {ndvi_val}, SAR: {sar_val}, pH: {ph}, OC: {carbon}, sand: {sand}, silt: {silt}, clay: {clay}
-SSURGO: {ssurgo_series}, {ssurgo_drainage}, {ssurgo_taxorder}, {map_unit_name}
-Infiltration: {infiltration}
-Question: {question}
-"""
+        q = st.sidebar.text_area("Ask something about this soil data:")
+
+        if st.sidebar.button("Ask") and q.strip():
+            prompt = f"Lat: {lat}, Lon: {lon}, NDVI: {ndvi.get('nd')}, SAR: {sar.get('VV')}, Clay: {clay}, Silt: {silt}, Sand: {sand}. Question: {q}"
             try:
-                response = openai.ChatCompletion.create(
-                    model="gpt-4",
-                    messages=[
-                        {"role": "system", "content": "You are a soil, remote sensing, and irrigation assistant."},
-                        {"role": "user", "content": prompt}
-                    ]
-                )
-                st.sidebar.write("**Response:**")
-                st.sidebar.write(response.choices[0].message.content)
+                if use_ai:
+                    try:
+                        with st.spinner("Asking OpenAI..."):
+                            res = openai.ChatCompletion.create(
+                                model="gpt-4",
+                                messages=[
+                                    {"role": "system", "content": "You are a soil and crop assistant."},
+                                    {"role": "user", "content": prompt}
+                                ]
+                            )
+                        st.sidebar.success(res.choices[0].message.content)
+                    except (RateLimitError, ServiceUnavailableError) as api_error:
+                        st.sidebar.warning(f"OpenAI API temporarily unavailable: {api_error}")
+                        st.sidebar.write("Please try again shortly.")
+                else:
+                    st.sidebar.info("(Offline mode) GPT disabled — here's a basic response.")
+                    st.sidebar.write("This soil appears to have moderate texture. NDVI indicates potential vegetation. Further management may depend on crop type.")
             except Exception as e:
-                st.sidebar.error(f"OpenAI error: {e}")
+                st.sidebar.error(f"AI failed: {e}")
