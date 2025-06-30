@@ -1,13 +1,10 @@
 streamlit==1.35.0
 leafmap==0.27.0
-geemap==0.30.0
-earthengine-api==0.1.368
 pandas
 numpy
-rasterio
 matplotlib
 shapely
 pyproj
-openai
+rasterio
 requests
-setuptools
+openai
