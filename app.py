@@ -1,176 +1,96 @@
 import streamlit as st
-from streamlit_folium import st_folium
 import leafmap.foliumap as leafmap
 import requests
+import json
+from datetime import datetime, timedelta
 import openai
-import matplotlib.pyplot as plt
-from datetime import datetime
-
-# --- Streamlit Setup ---
-st.set_page_config(layout="wide")
 import os
-openai.api_key = os.getenv("OPENAI_API_KEY")
 
+# --- UI Setup ---
+st.set_page_config(layout="wide")
+st.title("🌱 Soil Moisture & Vegetation Intelligence")
 
-# --- GEE Endpoints ---
-NDVI_API = "https://soil-moisture-app-464506.projects.earthengine.app/view/ndvi-point"
-SAR_API = "https://soil-moisture-app-464506.projects.earthengine.app/view/sar-vv"
-TS_API = "https://soil-moisture-app-464506.projects.earthengine.app/view/time-series"
-
-# --- SoilWeb Lookup ---
-def get_soilweb_info(lat, lon):
-    try:
-        url = f"https://casoilresource.lawr.ucdavis.edu/soil_web_api/soil_series.php?lat={lat}&lon={lon}"
-        r = requests.get(url, timeout=5)
-        return r.json().get("soil_series_name", "Unknown")
-    except:
-        return "Lookup failed"
-
-# --- Open-Meteo Live Weather ---
-def get_weather(lat, lon):
-    try:
-        url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current_weather=true"
-        r = requests.get(url, timeout=5)
-        if r.ok:
-            weather = r.json().get("current_weather", {})
-            return f"{weather.get('temperature', '?')}°C, {weather.get('windspeed', '?')} km/h wind"
-    except:
-        return "Weather unavailable"
-    return "Weather unavailable"
-
-# --- NDVI Value ---
-def get_ndvi(lat, lon):
-    try:
-        url = f"{NDVI_API}?lat={lat}&lon={lon}"
-        r = requests.get(url, timeout=10)
-        if r.ok and "ndvi" in r.text:
-            val = r.text.split(":")[1].replace("}", "").strip()
-            return None if "null" in val else float(val)
-    except:
-        pass
-    return None
-
-# --- SAR Moisture VV ---
-def get_sar_vv(lat, lon):
-    try:
-        url = f"{SAR_API}?lat={lat}&lon={lon}"
-        r = requests.get(url, timeout=10)
-        if r.ok and "vv" in r.text:
-            return float(r.text.split(":")[1].replace("}", "").strip())
-    except:
-        pass
-    return None
-
-# --- Time Series ---
-def get_time_series(lat, lon):
-    try:
-        url = f"{TS_API}?lat={lat}&lon={lon}"
-        r = requests.get(url, timeout=15)
-        data = r.json()
-        return [
-            {
-                "date": d[0],
-                "VV": d[1] if isinstance(d[1], (int, float)) else None,
-                "NDVI": d[2] if isinstance(d[2], (int, float)) else None,
-            }
-            for d in data if d
-        ]
-    except:
-        return []
-
-# --- Sidebar AI Assistant ---
 with st.sidebar:
-    st.title("🧠 AI Field Assistant")
-    q = st.text_area("Ask about the clicked point:")
-    if st.button("Ask AI"):
-        lat, lon = st.session_state.get("last_coords", (None, None))
-        soil = st.session_state.get("soil_type", "unknown")
-        sar = st.session_state.get("sar_val", "unknown")
-        ndvi = st.session_state.get("ndvi_val", "unknown")
-        weather = st.session_state.get("weather", "unknown")
-        prompt = f"""
-        Latitude: {lat}, Longitude: {lon}
-        Soil Type: {soil}
-        SAR Moisture (VV): {sar}
-        NDVI: {ndvi}
-        Weather: {weather}
-        Question: {q}
-        """
-        try:
-            reply = openai.chat.completions.create(
-                model="gpt-4",
-                messages=[
-                    {"role": "system", "content": "You are a helpful agricultural assistant."},
-                    {"role": "user", "content": prompt},
-                ]
-            )
-            st.write("**AI Response:**")
-            st.write(reply.choices[0].message.content)
-        except Exception as e:
-            st.error(f"OpenAI error: {e}")
+    st.header("Assistant")
+    if "chat_history" not in st.session_state:
+        st.session_state.chat_history = []
+    user_input = st.text_input("Ask about this point...")
+    if user_input:
+        st.session_state.chat_history.append({"role": "user", "content": user_input})
+        if "OPENAI_API_KEY" in st.secrets:
+            openai.api_key = st.secrets["OPENAI_API_KEY"]
+            try:
+                chat = openai.ChatCompletion.create(
+                    model="gpt-4",
+                    messages=[{"role": "system", "content": "You are a helpful assistant for interpreting satellite and soil data."}] + st.session_state.chat_history
+                )
+                reply = chat.choices[0].message.content
+                st.session_state.chat_history.append({"role": "assistant", "content": reply})
+            except Exception as e:
+                reply = f"OpenAI error: {str(e)}"
+                st.session_state.chat_history.append({"role": "assistant", "content": reply})
+        else:
+            reply = "OpenAI key not set in secrets.toml"
+            st.session_state.chat_history.append({"role": "assistant", "content": reply})
+    for msg in st.session_state.chat_history:
+        st.markdown(f"**{msg['role'].capitalize()}:** {msg['content']}")
 
-# --- Interactive Map ---
-m = leafmap.Map(center=[37.5, -120.9], zoom=10)
-m.add_draw_control = True  # Enable drawing tool (this is valid on streamlit-folium + folium map)
-m.add_click_marker()
-m.add_tile_layer(
-    url="https://tiles.maps.eox.at/wmts/1.0.0/s2cloudless-2021_3857/default/g/{z}/{y}/{x}.jpg",
-    name="EOX Cloudless", attribution="EOX", opacity=0.7
-)
-st.markdown("## 🗺️ Field Tool")
-clicked = st_folium(m, height=600, width=1200)
+# --- Map ---
+m = leafmap.Map(center=[37.5, -120.8], zoom=8)
+m.add_basemap("HYBRID")
+m.add_layer_control()
+m.to_streamlit(height=600)
 
-# --- Handle Click ---
-if clicked and clicked.get("last_clicked"):
-    lat = clicked["last_clicked"]["lat"]
-    lon = clicked["last_clicked"]["lng"]
-    st.session_state["last_coords"] = (lat, lon)
+# --- Capture Click ---
+click_info = m.user_click()
+if click_info:
+    lat = click_info["lat"]
+    lon = click_info["lng"]
+    st.success(f"📍 You clicked: {lat:.4f}, {lon:.4f}")
 
-    st.markdown(f"### 📍 Location: {lat:.4f}, {lon:.4f}")
+    # --- SoilWeb (via SoilGrids)
+    try:
+        soil_url = f"https://rest.soilgrids.org/query?lon={lon}&lat={lat}"
+        soil_res = requests.get(soil_url)
+        if soil_res.ok:
+            soil_data = soil_res.json()
+            st.subheader("🧱 Soil Type")
+            st.json(soil_data)
+        else:
+            st.warning("Failed to retrieve soil data.")
+    except Exception as e:
+        st.warning(f"Soil data error: {e}")
 
-    # Fetch Soil
-    soil = get_soilweb_info(lat, lon)
-    st.session_state["soil_type"] = soil
-    st.success(f"🧱 Soil Type: {soil}")
+    # --- Weather Data (Open-Meteo)
+    try:
+        today = datetime.utcnow().date()
+        past = today - timedelta(days=7)
+        weather_url = (
+            f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}"
+            f"&daily=temperature_2m_max,temperature_2m_min,precipitation_sum"
+            f"&timezone=auto&start_date={past}&end_date={today}"
+        )
+        weather_res = requests.get(weather_url)
+        if weather_res.ok:
+            weather = weather_res.json()
+            st.subheader("🌦️ Weather (Past 7 Days)")
+            st.json(weather["daily"])
+        else:
+            st.warning("Failed to retrieve weather.")
+    except Exception as e:
+        st.warning(f"Weather error: {e}")
 
-    # Fetch SAR
-    sar = get_sar_vv(lat, lon)
-    st.session_state["sar_val"] = sar
-    if sar is not None:
-        st.info(f"💧 SAR VV (Soil Moisture): {sar:.2f} dB")
-    else:
-        st.warning("SAR VV unavailable")
+    # --- Earth Engine (NDVI + SAR links)
+    try:
+        ndvi_url = f"https://soil-moisture-app-464506.projects.earthengine.app/view/ndvi-point?lat={lat}&lon={lon}"
+        ts_url = f"https://soil-moisture-app-464506.projects.earthengine.app/view/time-series?lat={lat}&lon={lon}"
+        st.subheader("🛰️ Remote Sensing")
+        st.markdown(f"[📊 NDVI Value Viewer]({ndvi_url})")
+        st.markdown(f"[📈 Time Series NDVI + SAR]({ts_url})")
+    except Exception as e:
+        st.warning(f"Earth Engine link error: {e}")
 
-    # Fetch NDVI
-    ndvi = get_ndvi(lat, lon)
-    st.session_state["ndvi_val"] = ndvi
-    if ndvi is not None:
-        st.info(f"🌿 NDVI: {ndvi:.3f}")
-    else:
-        st.warning("NDVI unavailable")
+    st.session_state["last_clicked"] = {"lat": lat, "lon": lon}
 
-    # Weather
-    weather = get_weather(lat, lon)
-    st.session_state["weather"] = weather
-    st.info(f"🌤️ Weather: {weather}")
-
-    # --- Chart Time Series ---
-    series = get_time_series(lat, lon)
-    if series:
-        st.markdown("### 📈 NDVI + SAR Time Series")
-        dates = [datetime.strptime(r["date"], "%Y-%m-%d") for r in series]
-        ndvi_vals = [r["NDVI"] for r in series]
-        vv_vals = [r["VV"] for r in series]
-
-        fig, ax1 = plt.subplots()
-        ax1.set_xlabel("Date")
-        ax1.plot(dates, ndvi_vals, "g-", label="NDVI")
-        ax1.set_ylabel("NDVI", color="green")
-
-        ax2 = ax1.twinx()
-        ax2.plot(dates, vv_vals, "b-", label="VV (SAR)")
-        ax2.set_ylabel("VV dB", color="blue")
-        st.pyplot(fig)
-
-# --- AOI Export Placeholder ---
-st.markdown("### 📤 AOI Export Coming Soon")
+else:
+    st.info("Click on the map to load data for a specific location.")
