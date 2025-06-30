@@ -1,7 +1,9 @@
 import streamlit as st
-import leafmap.streamlit as leafmap
+import leafmap.foliumap as leafmap  # ✅ Supported module
 
 st.set_page_config(layout="wide")
-st.title("✅ Leafmap Streamlit Test")
+st.title("🌍 Soil Moisture Viewer (Stable Build)")
 
-leafmap.folium_map(center=[37.7749, -122.4194], zoom=10)
+m = leafmap.Map(center=[37.7749, -122.4194], zoom=10)
+m.add_basemap('HYBRID')
+m.to_streamlit(height=600)
