@@ -1,97 +1,83 @@
 import streamlit as st
 import leafmap.foliumap as leafmap
-import geemap.foliumap as geemap
-import ee
-
-# Earth Engine authentication
-try:
-    ee.Initialize()
-except Exception as e:
-    ee.Authenticate()
-    ee.Initialize()
 
 st.set_page_config(layout="wide")
 st.title("🛰️ Soil Moisture Intelligence Dashboard")
 
-# Sidebar
+# ---- SIDEBAR CONTROLS ----
 with st.sidebar:
     st.header("🔧 Controls")
-    ndvi_layer = st.checkbox("🛰️ Show NDVI (GEE - Sentinel-2)")
-    ndwi_layer = st.checkbox("💧 Show NDWI")
-    sar_layer = st.checkbox("📡 Show SAR Soil Moisture")
-    show_soil = st.checkbox("🌱 Show Soil Data")
-    show_chat = st.checkbox("🤖 Open Assistant")
+    ndvi_layer = st.checkbox("🛰️ NDVI (Sentinel-2 Tiles)", value=True)
+    sar_layer = st.checkbox("💧 Simulated SAR Soil Moisture")
+    veg_layer = st.checkbox("🌿 Vegetation Classification")
+    soil_layer = st.checkbox("🗺️ SSURGO Soil Map")
+    show_chat = st.checkbox("🤖 SoilBot Assistant")
 
-# Main map (using geemap if NDVI requested, else leafmap)
-if ndvi_layer:
-    m = geemap.Map(center=[37.5, -120], zoom=9, draw_control=True, measure_control=True)
-else:
-    m = leafmap.Map(center=[37.5, -120], zoom=9, draw_control=True, measure_control=True)
-
+# ---- INIT MAP ----
+m = leafmap.Map(center=[37.5, -120], zoom=9, draw_control=True, measure_control=True)
 m.add_basemap("HYBRID")
 
-# NDVI logic (only works locally)
-def add_gee_ndvi(map_object, geojson_roi):
-    ee_roi = ee.Geometry.Polygon(geojson_roi["geometry"]["coordinates"])
-
-    # Sentinel-2 SR
-    s2 = (
-        ee.ImageCollection("COPERNICUS/S2_SR")
-        .filterBounds(ee_roi)
-        .filterDate("2024-05-01", "2024-06-01")
-        .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", 20))
-        .median()
-        .clip(ee_roi)
+# ---- NDVI TILE OVERLAY (PRE-EXPORTED TILESET) ----
+if ndvi_layer:
+    ndvi_tiles = "https://tiles.stadiamaps.com/tiles/alidade_smooth/{z}/{x}/{y}.png"  # Replace w/ your NDVI tile URL
+    m.add_tile_layer(
+        url=ndvi_tiles,
+        name="NDVI (XYZ Tiles)",
+        attribution="Sentinel-2 NDVI",
+        opacity=0.7,
+        shown=True,
     )
 
-    ndvi = s2.normalizedDifference(["B8", "B4"]).rename("NDVI")
+# ---- SAR MOISTURE OVERLAY (SIMULATED) ----
+if sar_layer:
+    sar_url = "https://tiles.stadiamaps.com/tiles/alidade_smooth_dark/{z}/{x}/{y}.png"  # Simulated SAR-style look
+    m.add_tile_layer(
+        url=sar_url,
+        name="Simulated SAR Moisture",
+        attribution="Simulated SAR",
+        opacity=0.6,
+        shown=True,
+    )
 
-    ndvi_params = {
-        "min": 0.1,
-        "max": 0.9,
-        "palette": ["brown", "yellow", "green"],
-    }
-
-    map_object.addLayer(ndvi, ndvi_params, "NDVI (Sentinel-2)")
-
-# NDVI toggle
-if ndvi_layer:
-    roi_geojson = m.user_roi_geojson()
-    if roi_geojson:
-        add_gee_ndvi(m, roi_geojson)
-        st.success("✅ NDVI added from real Sentinel-2 data.")
+# ---- VEGETATION CLASSIFICATION (SIMULATED BASED ON DRAWN AOI) ----
+if veg_layer:
+    if m.user_roi_bounds():
+        st.subheader("🌱 Vegetation Classification")
+        st.info("Classified based on NDVI thresholds (simulated).")
+        st.json({
+            "Orchard Canopy": "NDVI > 0.6",
+            "Green Weeds": "NDVI 0.4–0.6",
+            "Dry Grass": "NDVI 0.2–0.4",
+            "Bare Soil": "NDVI < 0.2"
+        })
     else:
-        st.warning("Draw an AOI to load NDVI.")
+        st.warning("Draw an AOI to enable classification.")
 
-# Map interaction
+# ---- SOILWEB / SSURGO WMS OVERLAY ----
+if soil_layer:
+    m.add_wms_layer(
+        url="https://casoilresource.lawr.ucdavis.edu/arcgis/services/CA/SSURGO/MapServer/WMSServer?",
+        layers="0",
+        name="SSURGO Soil Units",
+        format="image/png",
+        transparent=True,
+        attribution="UC Davis Soil Resource Lab",
+    )
+
+# ---- AOI + COORDINATE INTERACTION ----
 m.to_streamlit(height=600)
 
-# Display bounding box if drawn
 if m.user_roi_bounds():
-    bounds = m.user_roi_bounds()
-    st.info(f"📐 AOI Bounds: {bounds}")
+    st.success(f"📐 AOI Bounds: {m.user_roi_bounds()}")
 
-# Click info
-clicked_coords = m.user_click()
-if clicked_coords:
-    st.success(f"🖱️ You clicked at: {clicked_coords}")
+if m.user_click():
+    st.success(f"🖱️ You clicked: {m.user_click()}")
 
-# Simulated vegetation data
-if m.user_roi_bounds():
-    st.subheader("🌿 Estimated Vegetation Cover (Simulated)")
-    veg_types = {
-        "Orchard Canopy": 32,
-        "Dead Grass": 14,
-        "Weeds": 24,
-        "Bare Ground": 30,
-    }
-    st.json(veg_types)
-
-# AI Assistant placeholder
+# ---- AI ASSISTANT PANEL ----
 if show_chat:
     st.subheader("🤖 SoilBot Assistant")
     user_input = st.chat_input("Ask something about this field...")
     if user_input:
-        st.chat_message("assistant").write(
-            f"You asked: *{user_input}*. I'll analyze your AOI soon!"
-        )
+        response = "This is a placeholder. Future AI will analyze soil, NDVI, SAR, and vegetation based on AOI."
+        st.chat_message("user").write(user_input)
+        st.chat_message("assistant").write(response)
