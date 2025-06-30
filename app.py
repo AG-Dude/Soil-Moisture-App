@@ -1,141 +1,77 @@
 import streamlit as st
+from streamlit_folium import st_folium
 import leafmap.foliumap as leafmap
 import requests
-import json
-import io
-import pandas as pd
-from datetime import datetime
+import openai
 
+# --- CONFIG ---
 st.set_page_config(layout="wide")
-st.title("🛰️ Soil & Crop Intelligence Dashboard")
+openai.api_key = st.secrets.get("OPENAI_API_KEY")  # Add key to Render Secrets tab
 
-# ------------------ SIDEBAR ------------------
+# --- SIDEBAR AI CHAT ---
 with st.sidebar:
-    st.header("🔧 Map Layers")
-    ndvi_layer = st.checkbox("🛰️ Sentinel-2 NDVI", value=True)
-    sar_layer = st.checkbox("📡 Sentinel-1 SAR Moisture", value=True)
-    ndwi_layer = st.checkbox("💧 NDWI (Water Index)", value=True)
-    veg_layer = st.checkbox("🌿 Vegetation Classification", value=True)
-    soil_layer = st.checkbox("🗺️ SSURGO Soil Map", value=True)
-    show_ai = st.checkbox("🤖 AI Assistant", value=True)
-    show_export = st.checkbox("⬇️ Export AOI Data", value=True)
+    st.title("🌾 Field Assistant")
+    user_input = st.text_area("Ask about the clicked area:", "")
+    if st.button("Ask AI"):
+        if "last_coords" in st.session_state:
+            prompt = f"You clicked at {st.session_state['last_coords']}. {user_input}"
+        else:
+            prompt = user_input
+        response = openai.ChatCompletion.create(
+            model="gpt-4",
+            messages=[{"role": "system", "content": "You are a soil and crop health assistant."},
+                      {"role": "user", "content": prompt}]
+        )
+        st.markdown("**AI Response:**")
+        st.write(response['choices'][0]['message']['content'])
 
-# ------------------ INIT MAP ------------------
-m = leafmap.Map(center=[37.5, -120], zoom=9, draw_control=True, measure_control=True)
-m.add_basemap("HYBRID")
+# --- MAIN PAGE ---
+st.title("🛰️ Soil Moisture & NDVI Viewer")
+st.markdown("Click on the map to view NDVI, SAR soil moisture, and soil info.")
 
-# ------------------ TILE LAYERS ------------------
-if ndvi_layer:
-    m.add_tile_layer(
-        url="https://services.sentinel-hub.com/ogc/wms/0f12e2d6-fake-ndvi-instance/layer=NDVI&style=default&format=image/png&TileMatrixSet=GoogleMapsCompatible&TileMatrix={z}&TileRow={y}&TileCol={x}",
-        name="NDVI",
-        attribution="SentinelHub",
-        opacity=0.75,
-    )
+# --- LEAFMAP SETUP ---
+m = leafmap.Map(center=[37.5, -120.9], zoom=10, draw_export=True)
+m.clear_controls()  # Remove default controls to prevent duplication
+m.add_draw_control()  # Add only one draw toolbar
 
-if sar_layer:
-    m.add_tile_layer(
-        url="https://tiles.maps.eox.at/wms?layers=sentinel1&styles=&service=WMS&request=GetMap&version=1.1.1&format=image/png&transparent=true&srs=EPSG:3857&bbox={xmin},{ymin},{xmax},{ymax}&width=256&height=256",
-        name="Sentinel-1 SAR",
-        attribution="EOX",
-        opacity=0.5,
-    )
+# --- ADD LAYERS ---
+m.add_tile_layer(
+    url="https://services.sentinel-hub.com/ogc/wms/YOUR_INSTANCE_ID?LAYERS=NDVI&FORMAT=image/png&TRANSPARENT=true",
+    name="Sentinel NDVI",
+    attribution="Sentinel Hub",
+    opacity=0.6
+)
 
-if ndwi_layer:
-    m.add_tile_layer(
-        url="https://tiles.maps.eox.at/wms?layers=ndwi&styles=&service=WMS&request=GetMap&version=1.1.1&format=image/png&transparent=true&srs=EPSG:3857&bbox={xmin},{ymin},{xmax},{ymax}&width=256&height=256",
-        name="NDWI",
-        attribution="EOX NDWI",
-        opacity=0.6,
-    )
+m.add_tile_layer(
+    url="https://some-sar-provider.com/tiles/{z}/{x}/{y}.png",
+    name="SAR Soil Moisture",
+    attribution="SAR Provider",
+    opacity=0.5
+)
 
-if soil_layer:
-    m.add_wms_layer(
-        url="https://casoilresource.lawr.ucdavis.edu/arcgis/services/CA/SSURGO/MapServer/WMSServer?",
-        layers="0",
-        name="SSURGO Soils",
-        format="image/png",
-        transparent=True,
-        attribution="UC Davis Soil Lab",
-    )
+m.add_basemap("SATELLITE")
+m.add_click_marker()
 
-# ------------------ VEGETATION CLASS ------------------
-if veg_layer and m.user_roi_bounds():
-    st.subheader("🌱 Vegetation Classification (based on NDVI)")
-    veg_data = {
-        "Orchard Canopy": "NDVI > 0.6",
-        "Green Weeds": "NDVI 0.4–0.6",
-        "Dry Grass": "NDVI 0.2–0.4",
-        "Bare Soil": "NDVI < 0.2"
-    }
-    st.json(veg_data)
+# --- STREAMLIT-FOLIUM RENDER ---
+output = st_folium(m, height=600, width=1200)
 
-# ------------------ INTERACTION ------------------
-m.to_streamlit(height=600)
+# --- HANDLE MAP CLICK ---
+if output and output.get("last_clicked"):
+    coords = output["last_clicked"]
+    lat, lon = coords["lat"], coords["lng"]
+    st.session_state["last_coords"] = f"Lat: {lat:.4f}, Lon: {lon:.4f}"
 
-if m.user_roi_bounds():
-    st.success(f"📐 AOI Bounds: {m.user_roi_bounds()}")
+    st.markdown(f"### 📍 Clicked Coordinates: {lat:.4f}, {lon:.4f}")
 
-if m.user_click():
-    st.info(f"🖱️ You clicked at: {m.user_click()}")
+    # MOCKUP DATA PULLS (Replace with real API requests)
+    ndvi_val = 0.72  # Replace with lookup from raster or API
+    sar_val = 0.34   # Replace with lookup from SAR service
+    soil_type = "Montpelier Loam"  # Replace with SoilWeb or SSURGO
 
-# ------------------ EXPORT AOI DATA ------------------
-if show_export and m.user_roi_bounds():
-    st.subheader("⬇️ AOI Export")
-    # Example CSV Summary (replace with real values if desired)
-    stats = {
-        "Average NDVI": [0.52],
-        "Estimated Moisture (SAR)": [0.33],
-        "Vegetation Type": ["Mixed Vegetation"]
-    }
-    df = pd.DataFrame(stats)
+    st.info(f"🟢 **NDVI**: {ndvi_val}")
+    st.info(f"💧 **Soil Moisture (SAR)**: {sar_val}")
+    st.info(f"🧱 **Soil Type**: {soil_type}")
 
-    csv_buffer = io.StringIO()
-    df.to_csv(csv_buffer, index=False)
-    st.download_button("Download Summary CSV", csv_buffer.getvalue(), file_name="aoi_summary.csv", mime="text/csv")
+    # Show popup content inline
+    st.markdown(f"**Popup Content:**\n- NDVI: {ndvi_val}\n- SAR Moisture: {sar_val}\n- Soil: {soil_type}")
 
-    geojson = {
-        "type": "FeatureCollection",
-        "features": [{
-            "type": "Feature",
-            "geometry": m.user_roi_bounds(as_geojson=True),
-            "properties": {"name": "AOI Export", "date": datetime.today().isoformat()}
-        }]
-    }
-    geojson_bytes = io.BytesIO(json.dumps(geojson).encode())
-    st.download_button("Download AOI GeoJSON", geojson_bytes, file_name="aoi.geojson", mime="application/json")
-
-# ------------------ AI ASSISTANT ------------------
-if show_ai:
-    st.subheader("🤖 SoilBot AI Assistant")
-
-    aoi = m.user_roi_bounds()
-    prompt = st.chat_input("Ask anything about the map, soil, or field conditions...")
-
-    if prompt:
-        context = f"""
-        You are an expert agronomist. The user has drawn an AOI with bounds: {aoi}.
-        They are viewing layers: NDVI, SAR soil moisture, NDWI, SSURGO soil, and vegetation classification.
-        Respond to their question with field-specific insights, irrigation guidance, or data interpretation.
-        """
-
-        payload = {
-            "model": "gpt-4",
-            "messages": [
-                {"role": "system", "content": context},
-                {"role": "user", "content": prompt}
-            ],
-            "temperature": 0.4
-        }
-
-        headers = {
-            "Authorization": f"Bearer {st.secrets['OPENAI_API_KEY']}",
-            "Content-Type": "application/json"
-        }
-
-        try:
-            res = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, data=json.dumps(payload))
-            reply = res.json()["choices"][0]["message"]["content"]
-            st.chat_message("assistant").write(reply)
-        except Exception as e:
-            st.error("⚠️ AI Assistant error: check API key or network.")
