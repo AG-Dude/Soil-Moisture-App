@@ -8,7 +8,9 @@ from datetime import datetime
 
 # --- Streamlit Setup ---
 st.set_page_config(layout="wide")
-openai.api_key = st.secrets.get("OPENAI_API_KEY")
+import os
+openai.api_key = os.environ.get("OPENAI_API_KEY")
+
 
 # --- Earth Engine App URLs ---
 NDVI_API = "https://soil-moisture-app-464506.projects.earthengine.app/view/ndvi-point"
