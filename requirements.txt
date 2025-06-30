@@ -11,3 +11,4 @@ requests
 openai
 streamlit-folium
 folium
+earthengine-api
