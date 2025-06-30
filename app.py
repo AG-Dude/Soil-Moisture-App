@@ -1,9 +1,10 @@
 import streamlit as st
-import leafmap.foliumap as leafmap  # ✅ Supported module
-
-st.set_page_config(layout="wide")
-st.title("🌍 Soil Moisture Viewer (Stable Build)")
-
-m = leafmap.Map(center=[37.7749, -122.4194], zoom=10)
-m.add_basemap('HYBRID')
-m.to_streamlit(height=600)
+import leafmap.foliumap as leafmap
+import geopandas as gpd
+import pandas as pd
+import numpy as np
+import requests
+import json
+from shapely.geometry import shape
+import ee
+ee.Initialize()
