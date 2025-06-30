@@ -111,7 +111,7 @@ with st.sidebar:
 
 # --- Interactive Map ---
 m = leafmap.Map(center=[37.5, -120.9], zoom=10)
-m.add_draw_control()
+m.add_draw_control = True  # Enable drawing tool (this is valid on streamlit-folium + folium map)
 m.add_click_marker()
 m.add_tile_layer(
     url="https://tiles.maps.eox.at/wmts/1.0.0/s2cloudless-2021_3857/default/g/{z}/{y}/{x}.jpg",
