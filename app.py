@@ -2,6 +2,9 @@ import streamlit as st
 import leafmap.foliumap as leafmap
 import requests
 import json
+import io
+import pandas as pd
+from datetime import datetime
 
 st.set_page_config(layout="wide")
 st.title("🛰️ Soil & Crop Intelligence Dashboard")
@@ -15,6 +18,7 @@ with st.sidebar:
     veg_layer = st.checkbox("🌿 Vegetation Classification", value=True)
     soil_layer = st.checkbox("🗺️ SSURGO Soil Map", value=True)
     show_ai = st.checkbox("🤖 AI Assistant", value=True)
+    show_export = st.checkbox("⬇️ Export AOI Data", value=True)
 
 # ------------------ INIT MAP ------------------
 m = leafmap.Map(center=[37.5, -120], zoom=9, draw_control=True, measure_control=True)
@@ -74,6 +78,32 @@ if m.user_roi_bounds():
 
 if m.user_click():
     st.info(f"🖱️ You clicked at: {m.user_click()}")
+
+# ------------------ EXPORT AOI DATA ------------------
+if show_export and m.user_roi_bounds():
+    st.subheader("⬇️ AOI Export")
+    # Example CSV Summary (replace with real values if desired)
+    stats = {
+        "Average NDVI": [0.52],
+        "Estimated Moisture (SAR)": [0.33],
+        "Vegetation Type": ["Mixed Vegetation"]
+    }
+    df = pd.DataFrame(stats)
+
+    csv_buffer = io.StringIO()
+    df.to_csv(csv_buffer, index=False)
+    st.download_button("Download Summary CSV", csv_buffer.getvalue(), file_name="aoi_summary.csv", mime="text/csv")
+
+    geojson = {
+        "type": "FeatureCollection",
+        "features": [{
+            "type": "Feature",
+            "geometry": m.user_roi_bounds(as_geojson=True),
+            "properties": {"name": "AOI Export", "date": datetime.today().isoformat()}
+        }]
+    }
+    geojson_bytes = io.BytesIO(json.dumps(geojson).encode())
+    st.download_button("Download AOI GeoJSON", geojson_bytes, file_name="aoi.geojson", mime="application/json")
 
 # ------------------ AI ASSISTANT ------------------
 if show_ai:
