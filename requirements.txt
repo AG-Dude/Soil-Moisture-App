@@ -9,3 +9,5 @@ pyproj
 rasterio
 requests
 openai
+streamlit-folium
+folium
