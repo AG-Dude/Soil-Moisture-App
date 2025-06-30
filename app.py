@@ -3,15 +3,15 @@ import leafmap.foliumap as leafmap
 import requests
 import json
 
-# ------------------ PAGE SETUP ------------------
 st.set_page_config(layout="wide")
-st.title("🛰️ Soil Moisture Intelligence Dashboard")
+st.title("🛰️ Soil & Crop Intelligence Dashboard")
 
 # ------------------ SIDEBAR ------------------
 with st.sidebar:
     st.header("🔧 Map Layers")
     ndvi_layer = st.checkbox("🛰️ Sentinel-2 NDVI", value=True)
     sar_layer = st.checkbox("📡 Sentinel-1 SAR Moisture", value=True)
+    ndwi_layer = st.checkbox("💧 NDWI (Water Index)", value=True)
     veg_layer = st.checkbox("🌿 Vegetation Classification", value=True)
     soil_layer = st.checkbox("🗺️ SSURGO Soil Map", value=True)
     show_ai = st.checkbox("🤖 AI Assistant", value=True)
@@ -20,26 +20,31 @@ with st.sidebar:
 m = leafmap.Map(center=[37.5, -120], zoom=9, draw_control=True, measure_control=True)
 m.add_basemap("HYBRID")
 
-# ------------------ NDVI TILE LAYER (Real) ------------------
+# ------------------ TILE LAYERS ------------------
 if ndvi_layer:
-    ndvi_tiles = "https://tiles.maps.eox.at/wms?layers=s2truecolor&styles=&service=WMS&request=GetMap&version=1.1.1&format=image/png&transparent=true&srs=EPSG:3857&bbox={xmin},{ymin},{xmax},{ymax}&width=256&height=256"
     m.add_tile_layer(
-        url="https://services.sentinel-hub.com/ogc/wms/<your_instance_id>?layer=NDVI&style=default&format=image/png&TileMatrixSet=GoogleMapsCompatible&TileMatrix={z}&TileRow={y}&TileCol={x}",
-        name="Real NDVI",
-        attribution="Sentinel-2 EO Browser",
+        url="https://services.sentinel-hub.com/ogc/wms/0f12e2d6-fake-ndvi-instance/layer=NDVI&style=default&format=image/png&TileMatrixSet=GoogleMapsCompatible&TileMatrix={z}&TileRow={y}&TileCol={x}",
+        name="NDVI",
+        attribution="SentinelHub",
         opacity=0.75,
     )
 
-# ------------------ SAR TILE LAYER (Real) ------------------
 if sar_layer:
     m.add_tile_layer(
         url="https://tiles.maps.eox.at/wms?layers=sentinel1&styles=&service=WMS&request=GetMap&version=1.1.1&format=image/png&transparent=true&srs=EPSG:3857&bbox={xmin},{ymin},{xmax},{ymax}&width=256&height=256",
         name="Sentinel-1 SAR",
-        attribution="Sentinel-1 VV",
+        attribution="EOX",
         opacity=0.5,
     )
 
-# ------------------ SSURGO SOIL LAYER ------------------
+if ndwi_layer:
+    m.add_tile_layer(
+        url="https://tiles.maps.eox.at/wms?layers=ndwi&styles=&service=WMS&request=GetMap&version=1.1.1&format=image/png&transparent=true&srs=EPSG:3857&bbox={xmin},{ymin},{xmax},{ymax}&width=256&height=256",
+        name="NDWI",
+        attribution="EOX NDWI",
+        opacity=0.6,
+    )
+
 if soil_layer:
     m.add_wms_layer(
         url="https://casoilresource.lawr.ucdavis.edu/arcgis/services/CA/SSURGO/MapServer/WMSServer?",
@@ -50,7 +55,7 @@ if soil_layer:
         attribution="UC Davis Soil Lab",
     )
 
-# ------------------ VEGETATION CLASSIFICATION ------------------
+# ------------------ VEGETATION CLASS ------------------
 if veg_layer and m.user_roi_bounds():
     st.subheader("🌱 Vegetation Classification (based on NDVI)")
     veg_data = {
@@ -75,14 +80,13 @@ if show_ai:
     st.subheader("🤖 SoilBot AI Assistant")
 
     aoi = m.user_roi_bounds()
-    prompt = st.chat_input("Ask anything about this field or map...")
+    prompt = st.chat_input("Ask anything about the map, soil, or field conditions...")
 
     if prompt:
-        # Compose contextual prompt
         context = f"""
-        You are an AI agronomist. The user has drawn an AOI with bounds: {aoi}.
-        They are viewing NDVI, SAR moisture, and soil layers.
-        Answer their question with clarity and useful recommendations.
+        You are an expert agronomist. The user has drawn an AOI with bounds: {aoi}.
+        They are viewing layers: NDVI, SAR soil moisture, NDWI, SSURGO soil, and vegetation classification.
+        Respond to their question with field-specific insights, irrigation guidance, or data interpretation.
         """
 
         payload = {
@@ -104,4 +108,4 @@ if show_ai:
             reply = res.json()["choices"][0]["message"]["content"]
             st.chat_message("assistant").write(reply)
         except Exception as e:
-            st.error("⚠️ Failed to connect to AI assistant. Check your API key in `.streamlit/secrets.toml`.")
+            st.error("⚠️ AI Assistant error: check API key or network.")
