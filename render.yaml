@@ -2,6 +2,7 @@ services:
   - type: web
     name: soil-moisture-app
     env: python
+    region: oregon
     buildCommand: pip install -r requirements.txt
     startCommand: streamlit run app.py --server.port=$PORT --server.enableCORS=false
     envVars:
@@ -9,3 +10,10 @@ services:
         sync: false
       - key: EE_PRIVATE_KEY
         sync: false
+    buildFilter:
+      paths:
+        - app.py
+        - requirements.txt
+        - render.yaml
+    autoDeploy: true
+    plan: free
