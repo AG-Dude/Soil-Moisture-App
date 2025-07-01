@@ -10,7 +10,7 @@ try:
     import leafmap.foliumap as leafmap
     import ee
 except ModuleNotFoundError as e:
-    raise ModuleNotFoundError(f"Required module missing: {e.name}. Ensure all dependencies are installed, e.g., `pip install streamlit leafmap earthengine-api`." )
+    raise ModuleNotFoundError(f"Required module missing: {e.name}. Ensure all dependencies are installed, e.g., `pip install streamlit leafmap earthengine-api`.")
 
 st.set_page_config(layout="wide")
 st.title("🛰️ Soil Health & Remote Sensing Explorer")
@@ -23,8 +23,8 @@ if not gee_key:
 try:
     service_account_info = json.loads(gee_key)
     credentials = ee.ServiceAccountCredentials(
-        email=service_account_info["client_email"],
-        key=service_account_info
+        service_account_info["client_email"],
+        key_data=service_account_info
     )
     ee.Initialize(credentials)
 except Exception as e:
@@ -138,7 +138,12 @@ def get_point_time_series(lat, lon):
         _, ndwi_vals = extract_series(ndwi_series, "NDWI")
         _, sar_vals = extract_series(sar_series, "VV")
 
-        return pd.DataFrame({"Date": dates.getInfo(), "NDVI": ndvi_vals.getInfo(), "NDWI": ndwi_vals.getInfo(), "SAR_VV": sar_vals.getInfo()})
+        return pd.DataFrame({
+            "Date": dates.getInfo(),
+            "NDVI": ndvi_vals.getInfo(),
+            "NDWI": ndwi_vals.getInfo(),
+            "SAR_VV": sar_vals.getInfo()
+        })
     except Exception as e:
         st.warning(f"Time series extraction failed: {e}")
         return pd.DataFrame()
