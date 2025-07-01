@@ -32,12 +32,26 @@ def load_service_account_info():
             raise FileNotFoundError("No EE_PRIVATE_KEY found in env and no local JSON key file found.")
 
 # Earth Engine Auth
+from google.oauth2 import service_account
+
+def load_service_account_info():
+    env_key = os.getenv("EE_PRIVATE_KEY")
+    if env_key:
+        try:
+            return json.loads(env_key)
+        except Exception as e:
+            raise ValueError("EE_PRIVATE_KEY exists but could not be parsed as JSON: " + str(e))
+    else:
+        local_path = "soil-moisture-app-464506-85ef7849f949.json"
+        if os.path.exists(local_path):
+            with open(local_path) as f:
+                return json.load(f)
+        else:
+            raise FileNotFoundError("No EE_PRIVATE_KEY found in env and no local JSON key file found.")
+
 try:
     service_account_info = load_service_account_info()
-    credentials = ee.ServiceAccountCredentials(
-        service_account_info["client_email"],
-        key_data=service_account_info
-    )
+    credentials = service_account.Credentials.from_service_account_info(service_account_info)
     ee.Initialize(credentials)
 except Exception as e:
     st.error(f"Earth Engine initialization error: {e}")
