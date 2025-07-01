@@ -16,12 +16,14 @@ except ModuleNotFoundError as e:
 st.set_page_config(layout="wide")
 st.title("🛰️ Soil Health & Remote Sensing Explorer")
 
-# ✅ Fixed service account loader for Render or local
+# Optional debug toggle
+debug_mode = st.sidebar.checkbox("🧪 Debug Mode (disable Earth Engine)", value=False)
+
+# EE key loader with escape fix
 def load_service_account_info():
     env_key = os.getenv("EE_PRIVATE_KEY")
     if env_key:
         try:
-            # Properly convert escaped newlines to actual newlines
             env_key = env_key.replace("\\n", "\n")
             return json.loads(env_key)
         except Exception as e:
@@ -34,50 +36,59 @@ def load_service_account_info():
         else:
             raise FileNotFoundError("No EE_PRIVATE_KEY found in env and no local JSON key file found.")
 
-# ✅ Earth Engine Auth
-try:
-    service_account_info = load_service_account_info()
-    credentials = service_account.Credentials.from_service_account_info(service_account_info)
-    ee.Initialize(credentials)
-except Exception as e:
-    st.error(f"Earth Engine initialization error: {e}")
-    st.stop()
+# EE auth
+ee_initialized = False
+if not debug_mode:
+    try:
+        service_account_info = load_service_account_info()
+        credentials = service_account.Credentials.from_service_account_info(service_account_info)
+        ee.Initialize(credentials)
+        ee_initialized = True
+    except Exception as e:
+        st.warning(f"⚠️ Earth Engine initialization failed. Some features will be disabled.\n\nDetails: {e}")
+else:
+    st.info("🧪 Debug Mode: Earth Engine is disabled.")
 
 # Dates
 today = datetime.utcnow().date()
 start_10 = today - timedelta(days=10)
 start_30 = today - timedelta(days=30)
 
-# Interactive map
+# Map setup
 m = leafmap.Map(draw_control=True, measure_control=True)
 if "clicked" not in st.session_state:
     st.session_state.clicked = None
 if "aoi" not in st.session_state:
     st.session_state.aoi = None
 
-# Map overlays
-try:
-    ndvi_img = ee.ImageCollection("COPERNICUS/S2").filterDate(str(start_10), str(today)).median()
-    ndvi = ndvi_img.normalizedDifference(["B8", "B4"]).rename("NDVI")
-    ndvi_vis = {"min": 0.0, "max": 1.0, "palette": ["white", "green"]}
-    m.addLayer(ndvi, ndvi_vis, "NDVI Layer")
+# EE overlays (only if working)
+if ee_initialized:
+    try:
+        ndvi_img = ee.ImageCollection("COPERNICUS/S2").filterDate(str(start_10), str(today)).median()
+        ndvi = ndvi_img.normalizedDifference(["B8", "B4"]).rename("NDVI")
+        ndvi_vis = {"min": 0.0, "max": 1.0, "palette": ["white", "green"]}
+        m.addLayer(ndvi, ndvi_vis, "NDVI Layer")
 
-    ndwi = ndvi_img.normalizedDifference(["B3", "B11"]).rename("NDWI")
-    ndwi_vis = {"min": -1.0, "max": 1.0, "palette": ["brown", "blue"]}
-    m.addLayer(ndwi, ndwi_vis, "NDWI Soil Moisture")
+        ndwi = ndvi_img.normalizedDifference(["B3", "B11"]).rename("NDWI")
+        ndwi_vis = {"min": -1.0, "max": 1.0, "palette": ["brown", "blue"]}
+        m.addLayer(ndwi, ndwi_vis, "NDWI Soil Moisture")
 
-    sar_img = ee.ImageCollection("COPERNICUS/S1_GRD").filterDate(str(start_10), str(today)) \
-        .filter(ee.Filter.eq("instrumentMode", "IW")) \
-        .filter(ee.Filter.listContains("transmitterReceiverPolarisation", "VV")) \
-        .select("VV").mean()
-    sar_vis = {"min": -25, "max": 0, "palette": ["blue", "white"]}
-    m.addLayer(sar_img, sar_vis, "SAR VV Layer")
-except Exception as e:
-    st.warning(f"Could not load map overlays: {e}")
+        sar_img = ee.ImageCollection("COPERNICUS/S1_GRD").filterDate(str(start_10), str(today)) \
+            .filter(ee.Filter.eq("instrumentMode", "IW")) \
+            .filter(ee.Filter.listContains("transmitterReceiverPolarisation", "VV")) \
+            .select("VV").mean()
+        sar_vis = {"min": -25, "max": 0, "palette": ["blue", "white"]}
+        m.addLayer(sar_img, sar_vis, "SAR VV Layer")
+    except Exception as e:
+        st.warning(f"Could not load map overlays: {e}")
+else:
+    st.info("🛰️ Earth Engine overlays are disabled.")
 
 # AOI polygon analysis
 @st.cache_data(show_spinner=False)
 def extract_polygon_data(geom):
+    if not ee_initialized:
+        return {"Error": "Earth Engine not initialized"}
     try:
         point = ee.Geometry(geom['geometry'])
         img = ee.ImageCollection("COPERNICUS/S2").filterDate(str(start_10), str(today)).median()
@@ -115,8 +126,10 @@ def extract_polygon_data(geom):
         st.error(f"AOI extraction error: {e}")
         return {}
 
-# Point time series analysis
+# Point time series
 def get_point_time_series(lat, lon):
+    if not ee_initialized:
+        return pd.DataFrame()
     try:
         geom = ee.Geometry.Point([lon, lat])
         ndvi_series = ee.ImageCollection("COPERNICUS/S2") \
@@ -165,17 +178,17 @@ def get_point_time_series(lat, lon):
         st.warning(f"Time series extraction failed: {e}")
         return pd.DataFrame()
 
-# Hook up map interactions
+# Map interaction
 m.on_click(lambda **kwargs: st.session_state.update({"clicked": kwargs.get("latlng")}))
 m.on_draw(lambda action, geo_json: st.session_state.update({"aoi": geo_json}))
 
-# Map display
+# Display map
 st.subheader("🌍 Interactive Map")
 with st.spinner("Loading map..."):
     m.to_streamlit(height=600)
 
-# AOI analysis output
-if st.session_state.aoi:
+# AOI analysis
+if st.session_state.aoi and ee_initialized:
     with st.spinner("Analyzing AOI..."):
         data = extract_polygon_data(st.session_state.aoi)
         if data:
@@ -183,9 +196,11 @@ if st.session_state.aoi:
             st.write(data)
             df = pd.DataFrame([data])
             st.download_button("📥 Download AOI CSV", df.to_csv(index=False), file_name="aoi_analysis.csv")
+elif st.session_state.aoi:
+    st.info("AOI selected, but Earth Engine is disabled.")
 
-# Point time series output
-if st.session_state.clicked:
+# Time series chart
+if st.session_state.clicked and ee_initialized:
     lat, lon = st.session_state.clicked['lat'], st.session_state.clicked['lng']
     with st.spinner("Loading time series..."):
         ts_df = get_point_time_series(lat, lon)
@@ -197,8 +212,10 @@ if st.session_state.clicked:
             st.altair_chart(chart, use_container_width=True)
         else:
             st.info("No time series data found at this location.")
+elif st.session_state.clicked:
+    st.info("Time series requires Earth Engine, which is currently disabled.")
 
-# Sidebar display
+# Sidebar info
 st.sidebar.markdown("---")
 st.sidebar.subheader("🧱 Compaction Index")
 st.sidebar.caption("0 = loose, 1 = highly compacted")
