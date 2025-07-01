@@ -21,7 +21,7 @@ if not gee_key:
     st.stop()
 
 try:
-    service_account_info = json.loads(g ee_key)
+    service_account_info = json.loads(gee_key)
     credentials = ee.ServiceAccountCredentials(
         email=service_account_info["client_email"],
         key=service_account_info
