@@ -15,22 +15,23 @@ except ModuleNotFoundError as e:
 st.set_page_config(layout="wide")
 st.title("🛰️ Soil Health & Remote Sensing Explorer")
 
-gee_key = os.getenv("EE_PRIVATE_KEY")
-if not gee_key:
-    st.error("EE_PRIVATE_KEY not found. Set in Render environment variables.")
-    st.stop()
-
 try:
+    gee_key = os.getenv("EE_PRIVATE_KEY")
+    if not gee_key:
+        raise ValueError("EE_PRIVATE_KEY not found in environment variables.")
+
+    # Force it to be a valid JSON string
     if isinstance(gee_key, str):
         service_account_info = json.loads(gee_key)
     else:
-        service_account_info = gee_key  # Already a dict
+        raise ValueError("EE_PRIVATE_KEY is not a string.")
 
     credentials = ee.ServiceAccountCredentials(
         service_account_info["client_email"],
         key_data=service_account_info
     )
     ee.Initialize(credentials)
+
 except Exception as e:
     st.error(f"Earth Engine initialization error: {e}")
     st.stop()
