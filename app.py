@@ -1,4 +1,4 @@
-# --- app.py with AOI Analysis, Offline GPT Fallback, Loading Spinner, and Time Series Chart ---
+# --- app.py with Full NDVI/SAR, AOI, Time Series, Field Classification, Fallback AI, Spinner, and Compaction Modeling ---
 
 import os
 import json
@@ -17,9 +17,8 @@ except ModuleNotFoundError as e:
     raise ModuleNotFoundError(f"Required module missing: {e.name}. Ensure all dependencies are installed, e.g., `pip install streamlit leafmap earthengine-api openai`.")
 
 st.set_page_config(layout="wide")
-st.title("🛰️ Soil Moisture, NDVI, AOI & Soil Explorer")
+st.title("🛰️ Soil Health & Remote Sensing Explorer")
 
-# --- Environment Setup ---
 gee_key = os.getenv("EE_PRIVATE_KEY")
 if not gee_key:
     st.error("EE_PRIVATE_KEY not found. Set in Render environment variables.")
@@ -37,14 +36,14 @@ except Exception as e:
     st.stop()
 
 openai.api_key = os.getenv("OPENAI_API_KEY")
+if not openai.api_key or len(openai.api_key) <= 10:
+    st.warning("Invalid or missing OpenAI API key. AI assistant features will be disabled or run in offline mode.")
 use_ai = openai.api_key is not None and len(openai.api_key) > 10
 
-# --- Dates ---
 today = datetime.utcnow().date()
 start_10 = today - timedelta(days=10)
 start_30 = today - timedelta(days=30)
 
-# --- Map ---
 m = leafmap.Map(draw_control=True, measure_control=True)
 if "clicked" not in st.session_state:
     st.session_state.clicked = None
@@ -61,11 +60,18 @@ def extract_polygon_data(geom):
         s1 = ee.ImageCollection("COPERNICUS/S1_GRD").filterDate(str(start_10), str(today)) \
             .filter(ee.Filter.eq("instrumentMode", "IW")) \
             .filter(ee.Filter.listContains("transmitterReceiverPolarisation", "VV")) \
-            .select("VV").mean().rename("SAR_VV")
+            .select("VV")
+        sar_mean = s1.mean().rename("SAR_VV")
+        sar_std = s1.reduce(ee.Reducer.stdDev()).rename("SAR_stdDev")
 
-        composite = ndvi.addBands(s1)
-        mean = composite.reduceRegion(reducer=ee.Reducer.mean(), geometry=point, scale=10, bestEffort=True).getInfo()
-        return mean
+        composite = ndvi.addBands(sar_mean).addBands(sar_std)
+        stats = composite.reduceRegion(reducer=ee.Reducer.mean(), geometry=point, scale=10, bestEffort=True).getInfo()
+
+        if "SAR_stdDev" in stats:
+            value = stats["SAR_stdDev"]
+            stats["Compaction Index"] = round(min(max((value - 0.5) / 1.5, 0), 1), 3)
+
+        return stats
     except Exception as e:
         st.error(f"AOI extraction error: {e}")
         return {}
@@ -77,7 +83,6 @@ st.subheader("🌍 Interactive Map")
 with st.spinner("Loading map..."):
     m.to_streamlit(height=600)
 
-# --- AOI Analysis ---
 if st.session_state.aoi:
     with st.spinner("Analyzing AOI..."):
         data = extract_polygon_data(st.session_state.aoi)
@@ -87,7 +92,6 @@ if st.session_state.aoi:
             df = pd.DataFrame([data])
             st.download_button("📥 Download AOI CSV", df.to_csv(index=False), file_name="aoi_analysis.csv")
 
-# --- Click-Based Data ---
 if st.session_state.clicked:
     with st.spinner("Getting satellite + soil data..."):
         lat, lon = st.session_state.clicked
@@ -110,14 +114,16 @@ if st.session_state.clicked:
             ndvi = {"nd": None}
 
         try:
-            sar_img = ee.ImageCollection("COPERNICUS/S1_GRD") \
+            sar_collection = ee.ImageCollection("COPERNICUS/S1_GRD") \
                 .filterBounds(point).filterDate(str(start_10), str(today)) \
                 .filter(ee.Filter.eq("instrumentMode", "IW")) \
                 .filter(ee.Filter.listContains("transmitterReceiverPolarisation", "VV")) \
-                .select("VV").mean()
-            sar = sar_img.reduceRegion(ee.Reducer.mean(), point, 10).getInfo()
+                .select("VV")
+            sar_mean = sar_collection.mean().reduceRegion(ee.Reducer.mean(), point, 10).getInfo()
+            sar_std = sar_collection.reduce(ee.Reducer.stdDev()).reduceRegion(ee.Reducer.mean(), point, 10).getInfo()
         except Exception:
-            sar = {"VV": None}
+            sar_mean = {"VV": None}
+            sar_std = {"VV_stdDev": None}
 
         try:
             sg_url = f"https://rest.soilgrids.org/query?lon={lon}&lat={lat}"
@@ -130,19 +136,22 @@ if st.session_state.clicked:
         except Exception:
             clay = silt = sand = None
 
+        compaction_index = round(min(max((sar_std.get("VV_stdDev", 0) - 0.5) / 1.5, 0), 1), 3) if sar_std.get("VV_stdDev") else None
+
         st.write({
             "Latitude": lat, "Longitude": lon,
             "NDVI": ndvi.get("nd"),
-            "SAR VV": sar.get("VV"),
+            "SAR VV": sar_mean.get("VV"),
+            "SAR stddev (Compaction Proxy)": sar_std.get("VV_stdDev"),
+            "Compaction Index": compaction_index,
             "Clay %": clay, "Silt %": silt, "Sand %": sand
         })
 
-        # --- Fallback AI ---
         st.sidebar.header("💬 Ask the AI")
         q = st.sidebar.text_area("Ask something about this soil data:")
 
         if st.sidebar.button("Ask") and q.strip():
-            prompt = f"Lat: {lat}, Lon: {lon}, NDVI: {ndvi.get('nd')}, SAR: {sar.get('VV')}, Clay: {clay}, Silt: {silt}, Sand: {sand}. Question: {q}"
+            prompt = f"Lat: {lat}, Lon: {lon}, NDVI: {ndvi.get('nd')}, SAR: {sar_mean.get('VV')}, SAR stddev: {sar_std.get('VV_stdDev')}, Compaction Index: {compaction_index}, Clay: {clay}, Silt: {silt}, Sand: {sand}. Question: {q}"
             try:
                 if use_ai:
                     try:
