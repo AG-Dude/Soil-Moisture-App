@@ -4,6 +4,7 @@ import pandas as pd
 import requests
 import altair as alt
 from datetime import datetime, timedelta
+from google.oauth2 import service_account
 
 try:
     import streamlit as st
