@@ -1,5 +1,3 @@
-# --- app.py with Full NDVI/SAR, AOI, Time Series, Field Classification, Fallback AI, Spinner, Compaction Modeling, Infiltration Curve, NDWI Soil Moisture ---
-
 import os
 import json
 import pandas as pd
@@ -11,21 +9,19 @@ try:
     import streamlit as st
     import leafmap.foliumap as leafmap
     import ee
-    import openai
-    from openai.error import RateLimitError, ServiceUnavailableError
 except ModuleNotFoundError as e:
-    raise ModuleNotFoundError(f"Required module missing: {e.name}. Ensure all dependencies are installed, e.g., `pip install streamlit leafmap earthengine-api openai`.")
+    raise ModuleNotFoundError(f"Required module missing: {e.name}. Ensure all dependencies are installed, e.g., `pip install streamlit leafmap earthengine-api`." )
 
 st.set_page_config(layout="wide")
 st.title("🛰️ Soil Health & Remote Sensing Explorer")
 
-gee_key = os.getenv("EE_PRIVATE_KEY")
-if not gee_key:
+g ee_key = os.getenv("EE_PRIVATE_KEY")
+if not g ee_key:
     st.error("EE_PRIVATE_KEY not found. Set in Render environment variables.")
     st.stop()
 
 try:
-    service_account_info = json.loads(gee_key)
+    service_account_info = json.loads(g ee_key)
     credentials = ee.ServiceAccountCredentials(
         email=service_account_info["client_email"],
         key=service_account_info
@@ -34,11 +30,6 @@ try:
 except Exception as e:
     st.error(f"Earth Engine initialization error: {e}")
     st.stop()
-
-openai.api_key = os.getenv("OPENAI_API_KEY")
-if not openai.api_key or len(openai.api_key) <= 10:
-    st.warning("Invalid or missing OpenAI API key. AI assistant features will be disabled or run in offline mode.")
-use_ai = openai.api_key is not None and len(openai.api_key) > 10
 
 today = datetime.utcnow().date()
 start_10 = today - timedelta(days=10)
@@ -167,22 +158,6 @@ if st.session_state.aoi:
             st.write(data)
             df = pd.DataFrame([data])
             st.download_button("📥 Download AOI CSV", df.to_csv(index=False), file_name="aoi_analysis.csv")
-
-if use_ai:
-    st.sidebar.title("🧠 AI Assistant")
-    user_input = st.sidebar.text_area("Ask a question about this field or data:")
-    if user_input:
-        with st.spinner("Thinking..."):
-            try:
-                response = openai.ChatCompletion.create(
-                    model="gpt-4",
-                    messages=[{"role": "user", "content": user_input}]
-                )
-                st.sidebar.success(response.choices[0].message.content)
-            except (RateLimitError, ServiceUnavailableError) as e:
-                st.sidebar.warning("AI unavailable, using fallback.")
-                fallback = "AI fallback: Based on your question, you may want to inspect NDVI/NDWI trends, infiltration patterns, or SAR variability."
-                st.sidebar.info(fallback)
 
 if st.session_state.clicked:
     lat, lon = st.session_state.clicked['lat'], st.session_state.clicked['lng']
