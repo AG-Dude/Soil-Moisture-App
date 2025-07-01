@@ -21,7 +21,11 @@ if not gee_key:
     st.stop()
 
 try:
-    service_account_info = json.loads(gee_key)
+    if isinstance(gee_key, str):
+        service_account_info = json.loads(gee_key)
+    else:
+        service_account_info = gee_key  # Already a dict
+
     credentials = ee.ServiceAccountCredentials(
         service_account_info["client_email"],
         key_data=service_account_info
