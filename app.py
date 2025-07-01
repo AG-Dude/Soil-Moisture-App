@@ -1,3 +1,5 @@
+# --- app.py with Full NDVI/SAR, AOI, Time Series, Field Classification, Fallback AI, Spinner, Compaction Modeling, Infiltration Curve, NDWI Soil Moisture ---
+
 import os
 import json
 import pandas as pd
@@ -54,6 +56,10 @@ try:
     ndvi_vis = {"min": 0.0, "max": 1.0, "palette": ["white", "green"]}
     m.addLayer(ndvi, ndvi_vis, "NDVI Layer")
 
+    ndwi = ndvi_img.normalizedDifference(["B3", "B11"]).rename("NDWI")
+    ndwi_vis = {"min": -1.0, "max": 1.0, "palette": ["brown", "blue"]}
+    m.addLayer(ndwi, ndwi_vis, "NDWI Soil Moisture")
+
     sar_img = ee.ImageCollection("COPERNICUS/S1_GRD").filterDate(str(start_10), str(today)) \
         .filter(ee.Filter.eq("instrumentMode", "IW")) \
         .filter(ee.Filter.listContains("transmitterReceiverPolarisation", "VV")) \
@@ -69,6 +75,7 @@ def extract_polygon_data(geom):
         point = ee.Geometry(geom['geometry'])
         img = ee.ImageCollection("COPERNICUS/S2").filterDate(str(start_10), str(today)).median()
         ndvi = img.normalizedDifference(["B8", "B4"]).rename("NDVI")
+        ndwi = img.normalizedDifference(["B3", "B11"]).rename("NDWI")
 
         s1 = ee.ImageCollection("COPERNICUS/S1_GRD").filterDate(str(start_10), str(today)) \
             .filter(ee.Filter.eq("instrumentMode", "IW")) \
@@ -77,7 +84,7 @@ def extract_polygon_data(geom):
         sar_mean = s1.mean().rename("SAR_VV")
         sar_std = s1.reduce(ee.Reducer.stdDev()).rename("SAR_stdDev")
 
-        composite = ndvi.addBands(sar_mean).addBands(sar_std)
+        composite = ndvi.addBands(ndwi).addBands(sar_mean).addBands(sar_std)
         stats = composite.reduceRegion(reducer=ee.Reducer.mean(), geometry=point, scale=10, bestEffort=True).getInfo()
 
         if "SAR_stdDev" in stats:
@@ -110,6 +117,12 @@ def get_point_time_series(lat, lon):
             .map(lambda img: img.set("date", img.date().format("YYYY-MM-dd"))) \
             .map(lambda img: img.normalizedDifference(["B8", "B4"]).rename("NDVI").copyProperties(img, ["date"]))
 
+        ndwi_series = ee.ImageCollection("COPERNICUS/S2") \
+            .filterDate(str(start_30), str(today)) \
+            .filterBounds(geom) \
+            .map(lambda img: img.set("date", img.date().format("YYYY-MM-dd"))) \
+            .map(lambda img: img.normalizedDifference(["B3", "B11"]).rename("NDWI").copyProperties(img, ["date"]))
+
         sar_series = ee.ImageCollection("COPERNICUS/S1_GRD") \
             .filterDate(str(start_30), str(today)) \
             .filterBounds(geom) \
@@ -130,10 +143,11 @@ def get_point_time_series(lat, lon):
             }))
             return values.aggregate_array("date"), values.aggregate_array(band)
 
-        dates_ndvi, ndvi_vals = extract_series(ndvi_series, "NDVI")
-        dates_sar, sar_vals = extract_series(sar_series, "VV")
+        dates, ndvi_vals = extract_series(ndvi_series, "NDVI")
+        _, ndwi_vals = extract_series(ndwi_series, "NDWI")
+        _, sar_vals = extract_series(sar_series, "VV")
 
-        return pd.DataFrame({"Date": dates_ndvi.getInfo(), "NDVI": ndvi_vals.getInfo(), "SAR_VV": sar_vals.getInfo()})
+        return pd.DataFrame({"Date": dates.getInfo(), "NDVI": ndvi_vals.getInfo(), "NDWI": ndwi_vals.getInfo(), "SAR_VV": sar_vals.getInfo()})
     except Exception as e:
         st.warning(f"Time series extraction failed: {e}")
         return pd.DataFrame()
@@ -167,7 +181,7 @@ if use_ai:
                 st.sidebar.success(response.choices[0].message.content)
             except (RateLimitError, ServiceUnavailableError) as e:
                 st.sidebar.warning("AI unavailable, using fallback.")
-                fallback = "AI fallback: Based on your question, you may want to inspect NDVI trends, soil texture, or recent SAR values in this field."
+                fallback = "AI fallback: Based on your question, you may want to inspect NDVI/NDWI trends, infiltration patterns, or SAR variability."
                 st.sidebar.info(fallback)
 
 if st.session_state.clicked:
@@ -175,8 +189,8 @@ if st.session_state.clicked:
     with st.spinner("Loading time series..."):
         ts_df = get_point_time_series(lat, lon)
         if not ts_df.empty:
-            st.subheader("📈 NDVI and SAR Time Series")
-            chart = alt.Chart(ts_df).transform_fold(["NDVI", "SAR_VV"]).mark_line().encode(
+            st.subheader("📈 NDVI, NDWI and SAR Time Series")
+            chart = alt.Chart(ts_df).transform_fold(["NDVI", "NDWI", "SAR_VV"]).mark_line().encode(
                 x="Date:T", y="value:Q", color="key:N"
             ).properties(height=300)
             st.altair_chart(chart, use_container_width=True)
