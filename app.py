@@ -15,7 +15,7 @@ except ModuleNotFoundError as e:
 st.set_page_config(layout="wide")
 st.title("🛰️ Soil Health & Remote Sensing Explorer")
 
-g ee_key = os.getenv("EE_PRIVATE_KEY")
+gee_key = os.getenv("EE_PRIVATE_KEY")
 if not g ee_key:
     st.error("EE_PRIVATE_KEY not found. Set in Render environment variables.")
     st.stop()
