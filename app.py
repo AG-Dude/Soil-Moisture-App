@@ -15,23 +15,30 @@ except ModuleNotFoundError as e:
 st.set_page_config(layout="wide")
 st.title("🛰️ Soil Health & Remote Sensing Explorer")
 
-try:
-    gee_key = os.getenv("EE_PRIVATE_KEY")
-    if not gee_key:
-        raise ValueError("EE_PRIVATE_KEY not found in environment variables.")
-
-    # Force it to be a valid JSON string
-    if isinstance(gee_key, str):
-        service_account_info = json.loads(gee_key)
+# Universal service account loader
+def load_service_account_info():
+    env_key = os.getenv("EE_PRIVATE_KEY")
+    if env_key:
+        try:
+            return json.loads(env_key)
+        except Exception as e:
+            raise ValueError("EE_PRIVATE_KEY exists but could not be parsed as JSON: " + str(e))
     else:
-        raise ValueError("EE_PRIVATE_KEY is not a string.")
+        local_path = "soil-moisture-app-464506-85ef7849f949.json"
+        if os.path.exists(local_path):
+            with open(local_path) as f:
+                return json.load(f)
+        else:
+            raise FileNotFoundError("No EE_PRIVATE_KEY found in env and no local JSON key file found.")
 
+# Earth Engine Auth
+try:
+    service_account_info = load_service_account_info()
     credentials = ee.ServiceAccountCredentials(
         service_account_info["client_email"],
         key_data=service_account_info
     )
     ee.Initialize(credentials)
-
 except Exception as e:
     st.error(f"Earth Engine initialization error: {e}")
     st.stop()
