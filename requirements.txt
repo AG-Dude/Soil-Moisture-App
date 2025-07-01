@@ -8,9 +8,11 @@ shapely
 pyproj
 rasterio
 requests==2.32.3
-openai==1.23.6
+openai==1.93.0
 streamlit-folium
 folium
-earthengine-api==0.1.385
-altair==5.3.0
+earthengine-api==0.1.386
+altair==5.5.0
 python-dotenv==1.0.1
+pydeck
+protobuf
