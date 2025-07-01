@@ -1,5 +1,3 @@
-# --- app.py with Full NDVI/SAR, AOI, Time Series, Field Classification, Fallback AI, Spinner, and Compaction Modeling ---
-
 import os
 import json
 import pandas as pd
@@ -50,6 +48,21 @@ if "clicked" not in st.session_state:
 if "aoi" not in st.session_state:
     st.session_state.aoi = None
 
+try:
+    ndvi_img = ee.ImageCollection("COPERNICUS/S2").filterDate(str(start_10), str(today)).median()
+    ndvi = ndvi_img.normalizedDifference(["B8", "B4"]).rename("NDVI")
+    ndvi_vis = {"min": 0.0, "max": 1.0, "palette": ["white", "green"]}
+    m.addLayer(ndvi, ndvi_vis, "NDVI Layer")
+
+    sar_img = ee.ImageCollection("COPERNICUS/S1_GRD").filterDate(str(start_10), str(today)) \
+        .filter(ee.Filter.eq("instrumentMode", "IW")) \
+        .filter(ee.Filter.listContains("transmitterReceiverPolarisation", "VV")) \
+        .select("VV").mean()
+    sar_vis = {"min": -25, "max": 0, "palette": ["blue", "white"]}
+    m.addLayer(sar_img, sar_vis, "SAR VV Layer")
+except Exception as e:
+    st.warning(f"Could not load map overlays: {e}")
+
 @st.cache_data(show_spinner=False)
 def extract_polygon_data(geom):
     try:
@@ -71,10 +84,59 @@ def extract_polygon_data(geom):
             value = stats["SAR_stdDev"]
             stats["Compaction Index"] = round(min(max((value - 0.5) / 1.5, 0), 1), 3)
 
+        latlon = point.centroid().coordinates().getInfo()[::-1]
+        ssurgo_resp = requests.get(f"https://rest.soilgrids.org/query?lon={latlon[1]}&lat={latlon[0]}")
+        if ssurgo_resp.status_code == 200:
+            sdata = ssurgo_resp.json()
+            clay = sdata['properties']['CLYPPT']['mean']
+            silt = sdata['properties']['SLTPPT']['mean']
+            stats["Clay %"] = round(clay, 1)
+            stats["Silt %"] = round(silt, 1)
+        else:
+            stats["Clay %"] = "Unavailable"
+            stats["Silt %"] = "Unavailable"
+
         return stats
     except Exception as e:
         st.error(f"AOI extraction error: {e}")
         return {}
+
+def get_point_time_series(lat, lon):
+    try:
+        geom = ee.Geometry.Point([lon, lat])
+        ndvi_series = ee.ImageCollection("COPERNICUS/S2") \
+            .filterDate(str(start_30), str(today)) \
+            .filterBounds(geom) \
+            .map(lambda img: img.set("date", img.date().format("YYYY-MM-dd"))) \
+            .map(lambda img: img.normalizedDifference(["B8", "B4"]).rename("NDVI").copyProperties(img, ["date"]))
+
+        sar_series = ee.ImageCollection("COPERNICUS/S1_GRD") \
+            .filterDate(str(start_30), str(today)) \
+            .filterBounds(geom) \
+            .filter(ee.Filter.eq("instrumentMode", "IW")) \
+            .filter(ee.Filter.listContains("transmitterReceiverPolarisation", "VV")) \
+            .select("VV") \
+            .map(lambda img: img.set("date", img.date().format("YYYY-MM-dd")))
+
+        def extract_series(imgcol, band):
+            values = imgcol.map(lambda img: ee.Feature(None, {
+                "date": img.get("date"),
+                band: img.reduceRegion(
+                    reducer=ee.Reducer.mean(),
+                    geometry=geom,
+                    scale=10,
+                    bestEffort=True
+                ).get(band)
+            }))
+            return values.aggregate_array("date"), values.aggregate_array(band)
+
+        dates_ndvi, ndvi_vals = extract_series(ndvi_series, "NDVI")
+        dates_sar, sar_vals = extract_series(sar_series, "VV")
+
+        return pd.DataFrame({"Date": dates_ndvi.getInfo(), "NDVI": ndvi_vals.getInfo(), "SAR_VV": sar_vals.getInfo()})
+    except Exception as e:
+        st.warning(f"Time series extraction failed: {e}")
+        return pd.DataFrame()
 
 m.on_click(lambda **kwargs: st.session_state.update({"clicked": kwargs.get("latlng")}))
 m.on_draw(lambda action, geo_json: st.session_state.update({"aoi": geo_json}))
@@ -92,83 +154,36 @@ if st.session_state.aoi:
             df = pd.DataFrame([data])
             st.download_button("📥 Download AOI CSV", df.to_csv(index=False), file_name="aoi_analysis.csv")
 
-if st.session_state.clicked:
-    with st.spinner("Getting satellite + soil data..."):
-        lat, lon = st.session_state.clicked
-        point = ee.Geometry.Point([lon, lat])
-
-        try:
-            ndvi_collection = ee.ImageCollection("COPERNICUS/S2").filterBounds(point).filterDate(str(start_30), str(today))
-            ndvi_series = ndvi_collection.map(lambda img: img.set('date', img.date().format()).normalizedDifference(["B8", "B4"]).rename("NDVI"))
-            chart_data = ndvi_series.map(lambda img: ee.Feature(None, {"NDVI": img.reduceRegion(ee.Reducer.mean(), point, 10).get("NDVI"), "date": img.get("date")})).flatten().getInfo()
-            chart_df = pd.DataFrame([f['properties'] for f in chart_data])
-            chart_df['date'] = pd.to_datetime(chart_df['date'])
-            st.altair_chart(alt.Chart(chart_df).mark_line().encode(x='date:T', y='NDVI:Q').properties(title="NDVI Time Series"), use_container_width=True)
-        except Exception as e:
-            st.warning(f"Could not generate NDVI time series: {e}")
-
-        try:
-            ndvi_img = ndvi_collection.median()
-            ndvi = ndvi_img.normalizedDifference(["B8", "B4"]).reduceRegion(ee.Reducer.mean(), point, 10).getInfo()
-        except Exception:
-            ndvi = {"nd": None}
-
-        try:
-            sar_collection = ee.ImageCollection("COPERNICUS/S1_GRD") \
-                .filterBounds(point).filterDate(str(start_10), str(today)) \
-                .filter(ee.Filter.eq("instrumentMode", "IW")) \
-                .filter(ee.Filter.listContains("transmitterReceiverPolarisation", "VV")) \
-                .select("VV")
-            sar_mean = sar_collection.mean().reduceRegion(ee.Reducer.mean(), point, 10).getInfo()
-            sar_std = sar_collection.reduce(ee.Reducer.stdDev()).reduceRegion(ee.Reducer.mean(), point, 10).getInfo()
-        except Exception:
-            sar_mean = {"VV": None}
-            sar_std = {"VV_stdDev": None}
-
-        try:
-            sg_url = f"https://rest.soilgrids.org/query?lon={lon}&lat={lat}"
-            resp = requests.get(sg_url)
-            resp.raise_for_status()
-            sg = resp.json()
-            clay = sg['properties']['layers']['clay']['depths'][0]['values']['mean']
-            silt = sg['properties']['layers']['silt']['depths'][0]['values']['mean']
-            sand = sg['properties']['layers']['sand']['depths'][0]['values']['mean']
-        except Exception:
-            clay = silt = sand = None
-
-        compaction_index = round(min(max((sar_std.get("VV_stdDev", 0) - 0.5) / 1.5, 0), 1), 3) if sar_std.get("VV_stdDev") else None
-
-        st.write({
-            "Latitude": lat, "Longitude": lon,
-            "NDVI": ndvi.get("nd"),
-            "SAR VV": sar_mean.get("VV"),
-            "SAR stddev (Compaction Proxy)": sar_std.get("VV_stdDev"),
-            "Compaction Index": compaction_index,
-            "Clay %": clay, "Silt %": silt, "Sand %": sand
-        })
-
-        st.sidebar.header("💬 Ask the AI")
-        q = st.sidebar.text_area("Ask something about this soil data:")
-
-        if st.sidebar.button("Ask") and q.strip():
-            prompt = f"Lat: {lat}, Lon: {lon}, NDVI: {ndvi.get('nd')}, SAR: {sar_mean.get('VV')}, SAR stddev: {sar_std.get('VV_stdDev')}, Compaction Index: {compaction_index}, Clay: {clay}, Silt: {silt}, Sand: {sand}. Question: {q}"
+if use_ai:
+    st.sidebar.title("🧠 AI Assistant")
+    user_input = st.sidebar.text_area("Ask a question about this field or data:")
+    if user_input:
+        with st.spinner("Thinking..."):
             try:
-                if use_ai:
-                    try:
-                        with st.spinner("Asking OpenAI..."):
-                            res = openai.ChatCompletion.create(
-                                model="gpt-4",
-                                messages=[
-                                    {"role": "system", "content": "You are a soil and crop assistant."},
-                                    {"role": "user", "content": prompt}
-                                ]
-                            )
-                        st.sidebar.success(res.choices[0].message.content)
-                    except (RateLimitError, ServiceUnavailableError) as api_error:
-                        st.sidebar.warning(f"OpenAI API temporarily unavailable: {api_error}")
-                        st.sidebar.write("Please try again shortly.")
-                else:
-                    st.sidebar.info("(Offline mode) GPT disabled — here's a basic response.")
-                    st.sidebar.write("This soil appears to have moderate texture. NDVI indicates potential vegetation. Further management may depend on crop type.")
-            except Exception as e:
-                st.sidebar.error(f"AI failed: {e}")
+                response = openai.ChatCompletion.create(
+                    model="gpt-4",
+                    messages=[{"role": "user", "content": user_input}]
+                )
+                st.sidebar.success(response.choices[0].message.content)
+            except (RateLimitError, ServiceUnavailableError) as e:
+                st.sidebar.warning("AI unavailable, using fallback.")
+                fallback = "AI fallback: Based on your question, you may want to inspect NDVI trends, soil texture, or recent SAR values in this field."
+                st.sidebar.info(fallback)
+
+if st.session_state.clicked:
+    lat, lon = st.session_state.clicked['lat'], st.session_state.clicked['lng']
+    with st.spinner("Loading time series..."):
+        ts_df = get_point_time_series(lat, lon)
+        if not ts_df.empty:
+            st.subheader("📈 NDVI and SAR Time Series")
+            chart = alt.Chart(ts_df).transform_fold(["NDVI", "SAR_VV"]).mark_line().encode(
+                x="Date:T", y="value:Q", color="key:N"
+            ).properties(height=300)
+            st.altair_chart(chart, use_container_width=True)
+        else:
+            st.info("No time series data found at this location.")
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("🧱 Compaction Index")
+st.sidebar.caption("0 = loose, 1 = highly compacted")
+st.sidebar.caption("Derived from SAR VV variability")
