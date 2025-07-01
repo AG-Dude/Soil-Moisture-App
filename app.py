@@ -16,11 +16,13 @@ except ModuleNotFoundError as e:
 st.set_page_config(layout="wide")
 st.title("🛰️ Soil Health & Remote Sensing Explorer")
 
-# Universal service account loader
+# ✅ Fixed service account loader for Render or local
 def load_service_account_info():
     env_key = os.getenv("EE_PRIVATE_KEY")
     if env_key:
         try:
+            # Properly convert escaped newlines to actual newlines
+            env_key = env_key.replace("\\n", "\n")
             return json.loads(env_key)
         except Exception as e:
             raise ValueError("EE_PRIVATE_KEY exists but could not be parsed as JSON: " + str(e))
@@ -32,24 +34,7 @@ def load_service_account_info():
         else:
             raise FileNotFoundError("No EE_PRIVATE_KEY found in env and no local JSON key file found.")
 
-# Earth Engine Auth
-from google.oauth2 import service_account
-
-def load_service_account_info():
-    env_key = os.getenv("EE_PRIVATE_KEY")
-    if env_key:
-        try:
-            return json.loads(env_key)
-        except Exception as e:
-            raise ValueError("EE_PRIVATE_KEY exists but could not be parsed as JSON: " + str(e))
-    else:
-        local_path = "soil-moisture-app-464506-85ef7849f949.json"
-        if os.path.exists(local_path):
-            with open(local_path) as f:
-                return json.load(f)
-        else:
-            raise FileNotFoundError("No EE_PRIVATE_KEY found in env and no local JSON key file found.")
-
+# ✅ Earth Engine Auth
 try:
     service_account_info = load_service_account_info()
     credentials = service_account.Credentials.from_service_account_info(service_account_info)
@@ -58,16 +43,19 @@ except Exception as e:
     st.error(f"Earth Engine initialization error: {e}")
     st.stop()
 
+# Dates
 today = datetime.utcnow().date()
 start_10 = today - timedelta(days=10)
 start_30 = today - timedelta(days=30)
 
+# Interactive map
 m = leafmap.Map(draw_control=True, measure_control=True)
 if "clicked" not in st.session_state:
     st.session_state.clicked = None
 if "aoi" not in st.session_state:
     st.session_state.aoi = None
 
+# Map overlays
 try:
     ndvi_img = ee.ImageCollection("COPERNICUS/S2").filterDate(str(start_10), str(today)).median()
     ndvi = ndvi_img.normalizedDifference(["B8", "B4"]).rename("NDVI")
@@ -87,6 +75,7 @@ try:
 except Exception as e:
     st.warning(f"Could not load map overlays: {e}")
 
+# AOI polygon analysis
 @st.cache_data(show_spinner=False)
 def extract_polygon_data(geom):
     try:
@@ -126,6 +115,7 @@ def extract_polygon_data(geom):
         st.error(f"AOI extraction error: {e}")
         return {}
 
+# Point time series analysis
 def get_point_time_series(lat, lon):
     try:
         geom = ee.Geometry.Point([lon, lat])
@@ -175,13 +165,16 @@ def get_point_time_series(lat, lon):
         st.warning(f"Time series extraction failed: {e}")
         return pd.DataFrame()
 
+# Hook up map interactions
 m.on_click(lambda **kwargs: st.session_state.update({"clicked": kwargs.get("latlng")}))
 m.on_draw(lambda action, geo_json: st.session_state.update({"aoi": geo_json}))
 
+# Map display
 st.subheader("🌍 Interactive Map")
 with st.spinner("Loading map..."):
     m.to_streamlit(height=600)
 
+# AOI analysis output
 if st.session_state.aoi:
     with st.spinner("Analyzing AOI..."):
         data = extract_polygon_data(st.session_state.aoi)
@@ -191,6 +184,7 @@ if st.session_state.aoi:
             df = pd.DataFrame([data])
             st.download_button("📥 Download AOI CSV", df.to_csv(index=False), file_name="aoi_analysis.csv")
 
+# Point time series output
 if st.session_state.clicked:
     lat, lon = st.session_state.clicked['lat'], st.session_state.clicked['lng']
     with st.spinner("Loading time series..."):
@@ -204,6 +198,7 @@ if st.session_state.clicked:
         else:
             st.info("No time series data found at this location.")
 
+# Sidebar display
 st.sidebar.markdown("---")
 st.sidebar.subheader("🧱 Compaction Index")
 st.sidebar.caption("0 = loose, 1 = highly compacted")
