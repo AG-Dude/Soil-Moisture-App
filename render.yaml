@@ -1,6 +1,15 @@
 services:
   - type: web
-    name: Soil-Moisture-App
+    name: soil-crop-scout
     env: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: streamlit run app.py --server.port=$PORT --server.enableCORS=false
+    plan: free
+    buildCommand: |
+      pip install -r requirements.txt
+    startCommand: |
+      bash start.sh
+    envVars:
+      - key: PORT
+        value: "10000"
+      # Put your GOOGLE EARTH ENGINE service-account JSON in this env var
+      - key: EE_PRIVATE_KEY
+        sync: false
