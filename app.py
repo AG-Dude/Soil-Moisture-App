@@ -1,39 +1,93 @@
 import os
 import json
-import pandas as pd
-import requests
-import altair as alt
-from datetime import datetime, timedelta
-from google.oauth2 import service_account
+from datetime import date, timedelta
 
+import streamlit as st
+import leafmap.foliumap as leafmap  # ✅ use foliumap, NOT "streamlitmap"
+import ee
+
+# ---------- Page ----------
+st.set_page_config(layout="wide", page_title="🌱 Soil & Crop Scout")
+st.title("🛰️ Soil & Crop Scout")
+st.caption("Sentinel-2 NDVI + Sentinel-1 SAR moisture proxy, ready for extension (drone & probes).")
+
+# ---------- Earth Engine init ----------
+def init_ee_from_env():
+    gee_key = os.getenv("EE_PRIVATE_KEY")
+    if not gee_key:
+        st.error("EE_PRIVATE_KEY not found. In Render → Environment → add EE_PRIVATE_KEY with your service account JSON.")
+        st.stop()
+
+    # Accepts either a pretty-printed JSON (with newlines) or a single-line JSON
+    try:
+        service_account_info = json.loads(gee_key)
+    except json.JSONDecodeError as e:
+        st.error(f"EE_PRIVATE_KEY is not valid JSON ({e}). Paste the full service account JSON.")
+        st.stop()
+
+    client_email = service_account_info.get("client_email")
+    if not client_email:
+        st.error("Service account JSON missing 'client_email'. Paste the exact JSON from Google Cloud → IAM → Service Accounts → Keys.")
+        st.stop()
+
+    try:
+        # ee.ServiceAccountCredentials can take the JSON string directly as key_data
+        credentials = ee.ServiceAccountCredentials(client_email, key_data=gee_key)
+        ee.Initialize(credentials)
+        return True
+    except Exception as e:
+        st.error(f"Earth Engine init failed: {e}")
+        st.stop()
+
+_ = init_ee_from_env()
+
+# ---------- Date widgets ----------
+today = date.today()
+start_default = today - timedelta(days=30)
+st.sidebar.header("Date Range")
+start_date = st.sidebar.date_input("Start", start_default)
+end_date = st.sidebar.date_input("End", today)
+if start_date >= end_date:
+    st.sidebar.error("Start must be before End.")
+    st.stop()
+
+# ---------- Map ----------
+m = leafmap.Map(center=[37.60, -120.90], zoom=10)
+m.add_basemap("HYBRID")
+
+# ---------- Sentinel-2 NDVI ----------
 try:
-    import streamlit as st
-    import leafmap.streamlitmap as leafmap  # ✅ switch to streamlitmap for on_click/on_draw
-    import ee
-except ModuleNotFoundError as e:
-    raise ModuleNotFoundError(f"Required module missing: {e.name}. Run: pip install streamlit leafmap earthengine-api")
+    s2 = (ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+          .filterDate(str(start_date), str(end_date))
+          .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 40))
+          .median())
 
-st.set_page_config(layout="wide")
-st.title("🛰️ Soil Health & Remote Sensing Explorer")
+    ndvi = s2.normalizedDifference(["B8", "B4"]).rename("NDVI")
+    ndvi_vis = {"min": 0.0, "max": 1.0, "palette": ["#8b4513", "#ffff00", "#00ff00"]}
+    m.addLayer(ndvi, ndvi_vis, f"NDVI {start_date}→{end_date}")
+except Exception as e:
+    st.warning(f"Sentinel-2 NDVI layer failed: {e}")
 
-debug_mode = st.sidebar.checkbox("🧪 Debug Mode (disable Earth Engine)", value=False)
+# ---------- Sentinel-1 SAR (VV) ----------
+try:
+    s1 = (ee.ImageCollection("COPERNICUS/S1_GRD")
+          .filterDate(str(start_date), str(end_date))
+          .filter(ee.Filter.eq("instrumentMode", "IW"))
+          .filter(ee.Filter.eq("resolution_meters", 10))
+          .filter(ee.Filter.eq("orbitProperties_pass", "DESCENDING"))
+          .filter(ee.Filter.eq("polarization", "VV"))
+          .mean())
 
-def load_service_account_info():
-    env_key = os.getenv("EE_PRIVATE_KEY")
-    if env_key:
-        try:
-            env_key = env_key.replace("\\n", "\n")
-            return json.loads(env_key)
-        except Exception as e:
-            raise ValueError("EE_PRIVATE_KEY exists but could not be parsed as JSON: " + str(e))
-    else:
-        local_path = "soil-moisture-app-464506-85ef7849f949.json"
-        if os.path.exists(local_path):
-            with open(local_path) as f:
-                return json.load(f)
-        else:
-            raise FileNotFoundError("No EE_PRIVATE_KEY found in env and no local key file found.")
+    sar_vv_vis = {"min": -20, "max": -2}
+    m.addLayer(s1.select("VV"), sar_vv_vis, f"SAR VV {start_date}→{end_date}")
+except Exception as e:
+    st.warning(f"Sentinel-1 SAR layer failed: {e}")
 
+# ---------- Optional: click help ----------
+st.sidebar.write("Tip: use the Layer Control on the map to toggle NDVI / SAR.")
+st.sidebar.write("Next: add drone upload + Sentek CSV and AI report generation.")
+
+m.to_streamlit(height=720)
 # Earth Engine safe init
 ee_initialized = False
 if not debug_mode:
