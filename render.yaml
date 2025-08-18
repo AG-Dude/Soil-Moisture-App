@@ -2,6 +2,7 @@ services:
   - type: web
     name: soil-crop-scout
     env: python
+    pythonVersion: 3.11.9
     plan: free
     buildCommand: |
       pip install -r requirements.txt
@@ -10,6 +11,5 @@ services:
     envVars:
       - key: PORT
         value: "10000"
-      # Put your GOOGLE EARTH ENGINE service-account JSON in this env var
       - key: EE_PRIVATE_KEY
         sync: false
