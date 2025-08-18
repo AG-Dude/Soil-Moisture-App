@@ -1,6 +1,5 @@
 streamlit==1.37.0
-leafmap==0.32.3
-geemap==0.32.0
+leafmap==0.50.0
 earthengine-api==0.1.420
 pandas==2.2.2
 altair==5.3.0
