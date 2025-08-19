@@ -2,7 +2,6 @@ services:
   - type: web
     name: SoilScout
     env: python
-    pythonVersion: 3.11.9
     plan: free
     buildCommand: |
       pip install -r requirements.txt
@@ -13,3 +12,4 @@ services:
         value: "10000"
       - key: EE_PRIVATE_KEY
         sync: false
+    runtime: python-3.11.9
