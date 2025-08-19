@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: soil-crop-scout
+    name: SoilScout
     env: python
     pythonVersion: 3.11.9
     plan: free
