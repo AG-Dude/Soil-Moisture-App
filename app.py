@@ -9,37 +9,54 @@ import ee
 # ---------- Page ----------
 st.set_page_config(layout="wide", page_title="🌱 Soil & Crop Scout")
 st.title("🛰️ Soil & Crop Scout")
-st.caption("Sentinel-2 NDVI + Sentinel-1 SAR moisture proxy, ready for extension (drone & probes).")
+st.caption("Sentinel-2 NDVI + Sentinel-1 SAR Moisture Proxy.")
 
 # ---------- Earth Engine init ----------
+import os, json, ee, streamlit as st
+
 def init_ee_from_env():
-    gee_key = os.getenv("EE_PRIVATE_KEY")
-    if not gee_key:
-        st.error("EE_PRIVATE_KEY not found. In Render → Environment → add EE_PRIVATE_KEY with your service account JSON.")
+    key = os.getenv("EE_PRIVATE_KEY")
+    if not key:
+        st.error("EE_PRIVATE_KEY is missing. In Render → Environment → add EE_PRIVATE_KEY with your full service-account JSON.")
         st.stop()
 
-    # Accepts either a pretty-printed JSON (with newlines) or a single-line JSON
+    # If someone pasted a dict with extra quotes, try to clean once
+    key_str = key.strip()
+    if key_str.startswith(("'", '"')) and key_str.endswith(("'", '"')):
+        key_str = key_str[1:-1]
+
+    # Some UIs remove newlines from the private_key; we tolerate both
     try:
-        service_account_info = json.loads(gee_key)
+        info = json.loads(key_str)
     except json.JSONDecodeError as e:
-        st.error(f"EE_PRIVATE_KEY is not valid JSON ({e}). Paste the full service account JSON.")
+        st.error(f"EE_PRIVATE_KEY is not valid JSON: {e}. Paste the EXACT JSON file you downloaded from Google (don’t wrap it).")
         st.stop()
 
-    client_email = service_account_info.get("client_email")
-    if not client_email:
-        st.error("Service account JSON missing 'client_email'. Paste the exact JSON from Google Cloud → IAM → Service Accounts → Keys.")
+    # Minimal sanity checks
+    missing = [f for f in ("type","client_email","private_key","token_uri") if f not in info]
+    if missing:
+        st.error(f"Service account JSON missing fields: {missing}. You likely pasted the wrong file. Use the key JSON from IAM → Service Accounts → Keys.")
         st.stop()
+
+    client_email = info["client_email"]
+    private_key = info["private_key"]
+
+    # Fix most common newline issue
+    if "\\n" in private_key and "-----BEGIN" in private_key:
+        # Convert escaped newlines to real newlines
+        info["private_key"] = private_key.replace("\\n", "\n")
+        key_str = json.dumps(info)
 
     try:
-        # ee.ServiceAccountCredentials can take the JSON string directly as key_data
-        credentials = ee.ServiceAccountCredentials(client_email, key_data=gee_key)
-        ee.Initialize(credentials)
-        return True
+        # Use the raw JSON string as key_data so we don't need a file
+        creds = ee.ServiceAccountCredentials(client_email, key_data=key_str)
+        ee.Initialize(creds)
+        st.success(f"Earth Engine initialized with {client_email}")
     except Exception as e:
         st.error(f"Earth Engine init failed: {e}")
         st.stop()
 
-_ = init_ee_from_env()
+init_ee_from_env()
 
 # ---------- Date widgets ----------
 today = date.today()
