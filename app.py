@@ -8,10 +8,10 @@ import streamlit as st
 # ---------------------------------------------------------------------
 # MUST be the first Streamlit command
 # ---------------------------------------------------------------------
-st.set_page_config(layout="wide", page_title="🌱 Soil & Crop Scout")
+st.set_page_config(layout="wide", page_title="🌱 Crop & Soil Scout")
 
 st.caption(f"Python runtime: {sys.version}")
-st.title("🛰️ Soil & Crop Scout")
+st.title("🛰️ Soil Scout")
 st.caption("Sentinel-2 NDVI + Sentinel-1 SAR moisture proxy (baseline).")
 
 # ---------------------------------------------------------------------
@@ -106,7 +106,8 @@ try:
     )
     ndvi = s2.normalizedDifference(["B8", "B4"]).rename("NDVI")
     ndvi_vis = {"min": 0.0, "max": 1.0, "palette": ["#8b4513", "#ffff00", "#00ff00"]}
-    m.addLayer(ndvi, ndvi_vis, f"NDVI {start_date}→{end_date}")
+    # ✅ leafmap uses add_ee_layer for EE images
+    m.add_ee_layer(ndvi, ndvi_vis, f"NDVI {start_date}→{end_date}")
 except Exception as e:
     st.warning(f"Sentinel-2 NDVI layer failed: {e}")
 
@@ -121,7 +122,8 @@ try:
         .mean()
     )
     sar_vv_vis = {"min": -20, "max": -2}
-    m.addLayer(s1.select("VV"), sar_vv_vis, f"SAR VV {start_date}→{end_date}")
+    # ✅ use add_ee_layer here as well
+    m.add_ee_layer(s1.select("VV"), sar_vv_vis, f"SAR VV {start_date}→{end_date}")
 except Exception as e:
     st.warning(f"Sentinel-1 SAR layer failed: {e}")
 
