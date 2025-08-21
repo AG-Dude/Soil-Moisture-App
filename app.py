@@ -32,6 +32,7 @@ def ee_init():
         st.error("EE_PRIVATE_KEY is missing/empty. Add FULL service-account JSON in Render → Environment.")
         st.stop()
 
+    # remove accidental wrapping quotes
     if (key.startswith('"') and key.endswith('"')) or (key.startswith("'") and key.endswith("'")):
         key = key[1:-1].strip()
 
@@ -73,38 +74,56 @@ def ee_init():
 ee = ee_init()
 
 # ─────────────────────────────────────────────────────────────────────
-# Leafmap (folium backend)
+# Leafmap (folium backend) + robust EE layer add
 # ─────────────────────────────────────────────────────────────────────
 try:
     import leafmap.foliumap as leafmap
 except Exception as e:
-    st.error(f"Leafmap import failed: {e}. Pin leafmap==0.50.0 (or 0.49.3).")
+    st.error(f"Leafmap import failed: {e}. Pin leafmap==0.50.0.")
     st.stop()
 
-# Robust EE layer adder (works across leafmap versions)
 def add_ee_image(m, image, vis, name):
+    """Add an EE image to the map regardless of leafmap version."""
     try:
         m.add_ee_layer(image, vis, name)
+        return
     except Exception:
+        pass
+    try:
+        tile = leafmap.ee_tile_layer(image, vis, name)
         try:
-            tile = leafmap.ee_tile_layer(image, vis, name)
-            try:
-                m.add_layer(tile)
-            except Exception:
-                m.add_child(tile)
-        except Exception as e:
-            st.warning(f"Failed to add '{name}': {e}")
+            m.add_layer(tile)
+        except Exception:
+            m.add_child(tile)
+    except Exception as e:
+        st.warning(f"Failed to add '{name}': {e}")
+
+def safe_to_streamlit(m, height=600):
+    """Render the map but swallow the StopException that can occur on rerun."""
+    try:
+        ret = m.to_streamlit(height=height)
+        return ret if ret is not None else {}
+    except Exception as e:
+        # Streamlit uses StopException to abort on rerun. Leafmap re-raises it as Exception.
+        if "StopException" in repr(e) or "StopException" in str(e):
+            st.stop()
+        # one retry (sometimes first render gets interrupted)
+        try:
+            ret = m.to_streamlit(height=height)
+            return ret if ret is not None else {}
+        except Exception as e2:
+            if "StopException" in repr(e2) or "StopException" in str(e2):
+                st.stop()
+            st.error(f"Map render failed: {e2}")
+            return {}
 
 # ─────────────────────────────────────────────────────────────────────
 # Session state defaults
 # ─────────────────────────────────────────────────────────────────────
 def default_center():
-    # Central Valley-ish
-    return (37.60, -120.90)
+    return (37.60, -120.90)  # Central Valley-ish
 
-def default_aoi_box(center_lat, center_lon, half_m=300):
-    # Build a small box (meters) around center
-    # Convert meters to degrees (approx)
+def default_aoi_box(center_lat, center_lon, half_m=400):
     lat_deg = half_m / 110540.0
     lon_deg = half_m / (111320.0 * max(0.0001, math.cos(math.radians(center_lat))))
     coords = [
@@ -120,35 +139,33 @@ if "center" not in st.session_state:
     st.session_state["center"] = default_center()
 if "aoi_geojson" not in st.session_state:
     clat, clon = st.session_state["center"]
-    st.session_state["aoi_geojson"] = default_aoi_box(clat, clon, half_m=300)
+    st.session_state["aoi_geojson"] = default_aoi_box(clat, clon, half_m=400)
 
 # ─────────────────────────────────────────────────────────────────────
-# Address search + AOI box selection (your requested UX)
+# Address search + AOI box selection
 # ─────────────────────────────────────────────────────────────────────
-with st.container():
-    st.subheader("Find a place & create AOI box")
-    c1, c2, c3 = st.columns([4, 2, 1])
-    with c1:
-        address = st.text_input("Search address or place", placeholder="e.g., 123 Farm Rd, Merced, CA")
-    with c2:
-        box_m = st.slider("AOI box half-size (meters)", 100, 2000, 400, 50)
-    with c3:
-        go = st.button("🔎 Find & Set AOI", use_container_width=True)
+st.subheader("Find a place & create AOI box")
+c1, c2, c3 = st.columns([4, 2, 1])
+with c1:
+    address = st.text_input("Search address or place", placeholder="e.g., 123 Farm Rd, Merced, CA")
+with c2:
+    box_m = st.slider("AOI box half-size (meters)", 100, 2000, 400, 50)
+with c3:
+    go = st.button("🔎 Find & Set AOI", use_container_width=True)
 
-    if go and address.strip():
-        try:
-            # leafmap.geocode returns (lat, lon)
-            latlon = leafmap.geocode(address)
-            if isinstance(latlon, (list, tuple)) and len(latlon) == 2:
-                clat, clon = float(latlon[0]), float(latlon[1])
-                st.session_state["center"] = (clat, clon)
-                st.session_state["aoi_geojson"] = default_aoi_box(clat, clon, half_m=box_m)
-                st.success(f"AOI set at {round(clat,6)}, {round(clon,6)} with half-size {box_m} m.")
-                st.experimental_rerun()
-            else:
-                st.error("Could not geocode that address.")
-        except Exception as e:
-            st.error(f"Geocoding failed: {e}")
+if go and address.strip():
+    try:
+        latlon = leafmap.geocode(address)  # returns (lat, lon)
+        if isinstance(latlon, (list, tuple)) and len(latlon) == 2:
+            clat, clon = float(latlon[0]), float(latlon[1])
+            st.session_state["center"] = (clat, clon)
+            st.session_state["aoi_geojson"] = default_aoi_box(clat, clon, half_m=box_m)
+            st.success(f"AOI set at {round(clat,6)}, {round(clon,6)} with half-size {box_m} m.")
+            st.experimental_rerun()
+        else:
+            st.error("Could not geocode that address.")
+    except Exception as e:
+        st.error(f"Geocoding failed: {e}")
 
 # ─────────────────────────────────────────────────────────────────────
 # Sidebar controls (date + overlays)
@@ -213,7 +230,6 @@ def soil_texture_12(aoi_geom):
     return ee.Image("OpenLandMap/SOL/SOL_TEXTURE-CLASS_USDA-12A1C_M/v02").select("b0").clip(aoi_geom)
 
 def soil_texture_edges(tex_img):
-    # edge mask of classes
     return tex_img.focal_min(1).neq(tex_img).selfMask()
 
 def reduce_stats(image, geom, scale=10):
@@ -238,8 +254,8 @@ def compute_water_pct(ndwi_img, geom, thresh=0.2, scale=10):
         pass
     return None
 
-# Erosion risk: S * K * C, normalized to 0–1
 def erosion_risk_layer(aoi_geom, ndvi_img):
+    """Relative erosion risk ~ S (slope) * K (soil erodibility) * C (cover from NDVI), normalized 0–1."""
     import ee
     dem = ee.Image("USGS/SRTMGL1_003").clip(aoi_geom)
     slope_deg = ee.Terrain.slope(dem)
@@ -260,7 +276,7 @@ def erosion_risk_layer(aoi_geom, ndvi_img):
     return risk.divide(p95.max(ee.Number(1e-6))).clamp(0, 1).rename("risk")
 
 # ─────────────────────────────────────────────────────────────────────
-# Build map from current AOI and toggles
+# Map + layers
 # ─────────────────────────────────────────────────────────────────────
 def build_map_and_layers():
     AOI = ee_aoi()
@@ -268,7 +284,7 @@ def build_map_and_layers():
     m = leafmap.Map(center=[clat, clon], zoom=14)
     m.add_basemap("HYBRID")
 
-    # Draw tools: rectangle only (simpler)
+    # Rectangle drawing (simple AOI edit)
     try:
         m.add_draw_control(
             draw_marker=False, draw_circle=False, draw_circlemarker=False,
@@ -295,7 +311,7 @@ def build_map_and_layers():
     except Exception:
         s1_count = 0
 
-    # Sentinel-2 composite
+    # Sentinel-2 composite (median)
     s2_img = None
     if s2_count > 0:
         try:
@@ -371,8 +387,8 @@ def build_map_and_layers():
         except Exception:
             pass
 
-    # Render map & capture drawing
-    draw_ret = m.to_streamlit(height=600)
+    # Render map (safe) & compute status
+    draw_ret = safe_to_streamlit(m, height=600)
 
     # Status bar
     try:
@@ -388,22 +404,19 @@ def build_map_and_layers():
     return draw_ret, AOI, ndvi_img, ndwi_img, sar_vv_img, risk_img
 
 # ─────────────────────────────────────────────────────────────────────
-# Read draw return (robust across streamlit-folium versions)
+# Read draw return (works across streamlit-folium versions)
 # ─────────────────────────────────────────────────────────────────────
 def parse_draw_geojson(draw_ret):
     if not isinstance(draw_ret, dict):
         return None
-    # possible keys: 'last_active_drawing', 'last_drawing', 'all_drawings'
     for key in ("last_active_drawing", "last_drawing"):
         obj = draw_ret.get(key)
         if obj and isinstance(obj, dict):
-            geom = obj.get("geometry") or obj  # sometimes it's a GeoJSON Feature or geometry
-            if isinstance(geom, dict) and "type" in geom:
-                # Feature?
+            geom = obj.get("geometry") or obj
+            if isinstance(geom, dict):
                 if geom.get("type") == "Feature" and "geometry" in geom:
                     geom = geom["geometry"]
                 return geom
-    # fallback: all_drawings list
     all_draw = draw_ret.get("all_drawings")
     if isinstance(all_draw, list) and len(all_draw) > 0:
         cand = all_draw[-1]
@@ -429,7 +442,7 @@ draw_ret, AOI, ndvi_img, ndwi_img, sar_vv_img, risk_img = build_map_and_layers()
 new_geom = parse_draw_geojson(draw_ret)
 if new_geom and not geojson_equal(new_geom, st.session_state["aoi_geojson"]):
     st.session_state["aoi_geojson"] = new_geom
-    # Recenter map to AOI bbox center
+    # Recenter to AOI centroid
     try:
         import ee
         cen = ee.Geometry(new_geom).centroid(1).coordinates().getInfo()
@@ -439,7 +452,7 @@ if new_geom and not geojson_equal(new_geom, st.session_state["aoi_geojson"]):
     st.experimental_rerun()
 
 # ─────────────────────────────────────────────────────────────────────
-# Quick previews (prove data exists even if tiles look cached)
+# Quick previews (prove data exists even if map tiles look cached)
 # ─────────────────────────────────────────────────────────────────────
 with st.expander("Quick previews (NDVI / NDWI / SAR)"):
     cols = st.columns(3)
@@ -468,7 +481,6 @@ with st.expander("Quick previews (NDVI / NDWI / SAR)"):
 # AOI Summary (NDVI stats, water %, erosion rating)
 # ─────────────────────────────────────────────────────────────────────
 st.subheader("AOI summary")
-
 rows = []
 
 if ndvi_img is not None:
@@ -508,7 +520,7 @@ if risk_img is not None:
 if rows:
     st.table(pd.DataFrame(rows, columns=["Metric", "Value"]))
 else:
-    st.info("Turn on NDVI/NDWI and draw or set an AOI to see summary metrics.")
+    st.info("Turn on NDVI/NDWI and set an AOI to see summary metrics.")
 
 # ─────────────────────────────────────────────────────────────────────
 # NDVI time-series + citation  (CACHE FIX: underscore param)
@@ -572,7 +584,4 @@ if ndvi_img is not None and st.button("Generate NDVI GeoTIFF URL"):
     except Exception as e:
         st.error(f"Export failed: {e}")
 
-# ─────────────────────────────────────────────────────────────────────
-# NOTE: AI helper has been disabled to avoid 'Client.init(... proxies)' errors.
-# If you want it back later, we’ll re-enable with a version-safe OpenAI client.
-# ─────────────────────────────────────────────────────────────────────
+# NOTE: AI helper intentionally removed (was causing 'Client.init(...proxies)' errors).
