@@ -7,3 +7,5 @@ requests==2.32.3
 numpy==1.26.4
 setuptools==70.1.1
 openai==1.40.2
+streamlit-folium==0.22.0
+folium==0.16.0
