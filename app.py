@@ -14,8 +14,8 @@ import pandas as pd
 st.set_page_config(layout="wide", page_title="🌱 Soil & Crop Scout")
 
 st.caption(f"Python runtime: {sys.version}")
-st.title("🛰️ Soil & Crop Scout")
-st.caption("Toggles: NDVI • NDWI • SAR • Water • Fallow (CDL) • CA Crops (CDL) • Soil Texture | AOI stats, time-series, export, and AI helper.")
+st.title("🛰️ Soil Scout")
+st.caption("Toggles: NDVI • NDWI • SAR")
 
 # ---------------------------------------------------------------------
 # Robust Earth Engine init (service-account via env var)
