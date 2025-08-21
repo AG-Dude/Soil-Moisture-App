@@ -8,409 +8,355 @@ import streamlit as st
 import altair as alt
 import pandas as pd
 
-# ---------------------------------------------------------------------
-# MUST be the first Streamlit command
-# ---------------------------------------------------------------------
-st.set_page_config(layout="wide", page_title="🌱 Soil & Crop Scout")
+# ─────────────────────────────────────────────────────────────────────
+# Page setup (must be first Streamlit call)
+# ─────────────────────────────────────────────────────────────────────
+st.set_page_config(layout="wide", page_title="🛰️ Soil Scout")
 
-st.caption(f"Python runtime: {sys.version}")
 st.title("🛰️ Soil Scout")
-st.caption("Toggles: NDVI • NDWI • SAR")
+st.caption("NDVI • NDWI • SAR • Water • Fallow (CDL) • Soil Texture • Erosion Risk | AOI stats, time-series, export, AI helper")
+st.caption(f"Python runtime: {sys.version}")
 
-# ---------------------------------------------------------------------
-# Robust Earth Engine init (service-account via env var)
-# ---------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────
+# Earth Engine init (service account JSON in EE_PRIVATE_KEY)
+# ─────────────────────────────────────────────────────────────────────
 def ee_init():
     try:
         import ee
     except Exception as e:
-        st.error(f"Earth Engine package not available: {e}. Make sure 'earthengine-api' is in requirements.txt.")
+        st.error(f"Earth Engine package not available: {e}. Ensure 'earthengine-api' is in requirements.txt.")
         st.stop()
 
     key = os.getenv("EE_PRIVATE_KEY", "").strip()
     if not key:
-        st.error("EE_PRIVATE_KEY is missing or empty. In Render → Environment, add EE_PRIVATE_KEY with your full service-account JSON.")
+        st.error("EE_PRIVATE_KEY is missing/empty. Add FULL service-account JSON in Render → Environment.")
         st.stop()
 
-    # If wrapped in a single pair of quotes, strip once
+    # If the JSON was pasted wrapped in one pair of quotes, strip once
     if (key.startswith('"') and key.endswith('"')) or (key.startswith("'") and key.endswith("'")):
         key = key[1:-1].strip()
 
-    # Must be full JSON, not just the PEM block
     if not key.lstrip().startswith("{"):
-        st.error("EE_PRIVATE_KEY does not start with '{'. Paste the ENTIRE service-account JSON (IAM → Service Accounts → Keys).")
+        st.error("EE_PRIVATE_KEY must be the ENTIRE service-account JSON (not just the PEM).")
         st.stop()
 
     try:
         info = json.loads(key)
     except Exception as e:
-        st.error(f"EE_PRIVATE_KEY is not valid JSON: {e}. Paste the exact file contents of the downloaded key JSON.")
+        st.error(f"EE_PRIVATE_KEY is not valid JSON: {e}")
         st.stop()
 
-    # Normalize private_key newlines if they arrived as '\\n'
+    # Normalize private key newlines if they arrived as '\\n'
     pk = info.get("private_key", "")
     if "\\n" in pk and "-----BEGIN" in pk:
         info["private_key"] = pk.replace("\\n", "\n")
         key = json.dumps(info)
 
-    # Minimal field check
     for f in ("type", "client_email", "private_key", "token_uri"):
         if f not in info:
-            st.error(f"Service-account JSON missing field: {f}. Create a fresh key JSON in IAM → Service Accounts → Keys.")
+            st.error(f"Service-account JSON missing field: {f}")
             st.stop()
 
     try:
         creds = ee.ServiceAccountCredentials(info["client_email"], key_data=key)
         ee.Initialize(creds)
-        _ = ee.Number(1).getInfo()  # sanity call
-        st.caption(f"✅ Earth Engine initialized as {info['client_email']}")
+        _ = ee.Number(1).getInfo()  # sanity
         return ee
     except Exception as e:
-        st.error("❌ Earth Engine init failed: " + str(e) +
-                 "\n\nCommon causes:\n"
-                 "• Earth Engine API not enabled for the project\n"
-                 "• Service account missing roles: earthengine.viewer, serviceusage.serviceUsageConsumer\n"
-                 "• Key pasted incorrectly (extra quotes / missing newlines)")
+        st.error(
+            "Earth Engine init failed: " + str(e) +
+            "\nCommon causes:\n"
+            "• Earth Engine API not enabled\n"
+            "• Service account lacks roles: earthengine.viewer, serviceusage.serviceUsageConsumer\n"
+            "• Key pasted incorrectly (extra quotes / missing newlines)"
+        )
         st.stop()
 
 ee = ee_init()
 
-# ---------------------------------------------------------------------
-# Map UI + controls
-# ---------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────
+# Map + controls
+# ─────────────────────────────────────────────────────────────────────
 try:
     import leafmap.foliumap as leafmap
 except Exception as e:
-    st.error(f"Leafmap import failed: {e}. Pin leafmap==0.50.0 (or 0.49.3) in requirements.txt.")
+    st.error(f"Leafmap import failed: {e}. Pin leafmap==0.50.0 (or 0.49.3).")
     st.stop()
 
 today = date.today()
 default_start = today - timedelta(days=30)
 
 with st.sidebar:
-    st.header("Date & Layers")
+    st.header("Date window")
     start_date = st.date_input("Start", default_start)
     end_date = st.date_input("End", today)
     if start_date >= end_date:
         st.error("Start must be before End.")
         st.stop()
 
-    cloud_thresh = st.slider("Max cloud % (S2 filter)", 0, 80, 40, 5)
+    cloud_thresh = st.slider("Max cloud % (Sentinel-2)", 0, 80, 40, 5)
 
-    st.markdown("**Overlays**")
+    st.header("Overlays")
     show_ndvi = st.checkbox("NDVI (S2)", True)
-    show_ndwi = st.checkbox("NDWI Water Index (S2)", False)
+    show_ndwi = st.checkbox("NDWI (S2)", False)
+    show_water = st.checkbox("Water mask (NDWI>0.2)", False)
     show_sar_vv = st.checkbox("SAR VV (S1)", True)
-    show_water = st.checkbox("Water Mask (NDWI>0.2)", False)
     show_fallow = st.checkbox("Fallow (CDL)", False)
-    show_cdl = st.checkbox("California Crops (CDL codes)", False)
-    show_soil_texture = st.checkbox("Soil Texture (USDA 12-class)", False)
+    show_cdl = st.checkbox("CA crops (CDL classes)", False)
+    show_soil_texture = st.checkbox("Soil texture (USDA 12-class)", False)
+    show_erosion = st.checkbox("Erosion risk (relative)", False)
 
-    st.markdown("---")
-    st.header("Area of Interest (AOI)")
-    lat = st.number_input("Center latitude", value=37.600000, format="%.6f")
-    lon = st.number_input("Center longitude", value=-120.900000, format="%.6f")
-    size_ha = st.number_input("Approx. field size (ha)", value=40.0, min_value=1.0, step=1.0)
-    st.caption("A square AOI is built around the center using the area above.")
+    st.info("Draw your AOI on the map using the square or polygon tool. If you don’t draw one, a small default box is used.")
 
-    st.markdown("---")
-    st.header("CDL Crop Codes (optional)")
-    cdl_codes_text = st.text_input(
-        "Comma-separated CDL codes (e.g., 36,52,3,59,57)",
-        value="36,52,3,59,57"  # Alfalfa, Grapes, Rice, Other Tree Nuts, Citrus
-    )
-    max_imgs = st.slider("Max images for NDVI time-series", 5, 60, 25, 5)
-    compute_btn = st.button("Compute AOI Summary")
-
-# Build AOI square from center + area
-area_m2 = float(size_ha) * 10000.0
-side_m = math.sqrt(area_m2)
-radius_m = side_m / 2.0
-aoi = ee.Geometry.Point([lon, lat]).buffer(radius_m).bounds()
-
-# Create map
-m = leafmap.Map(center=[lat, lon], zoom=14)
+# Create map with draw tools (default center = Central Valley; pan anywhere)
+center_lat, center_lon = 37.60, -120.90
+m = leafmap.Map(center=[center_lat, center_lon], zoom=12)
 m.add_basemap("HYBRID")
+
+# Add draw control (rectangle/polygon)
 try:
-    m.add_marker(location=[lat, lon], popup="AOI center")
+    m.add_draw_control()
+except Exception:
+    try:
+        m.add_draw_control(
+            draw_marker=False, draw_circle=False, draw_circlemarker=False,
+            draw_polyline=False, draw_rectangle=True, draw_polygon=True, edit=True, remove=True
+        )
+    except Exception:
+        pass
+
+# Default AOI outline (~0.5 km box) as a hint
+ee_aoi_default = ee.Geometry.Point([center_lon, center_lat]).buffer(250).bounds()
+try:
+    aoi_outline = ee.Image().byte().paint(ee_aoi_default, 1, 2)
+    m.add_ee_layer(aoi_outline.visualize(palette=["#00FFFF"]), {}, "Default AOI (outline)")
 except Exception:
     pass
 
-# AOI outline
-try:
-    aoi_outline = ee.Image().byte().paint(aoi, 1, 2)
-    m.add_ee_layer(aoi_outline.visualize(palette=["#00FFFF"]), {}, "AOI outline")
-except Exception as e:
-    st.warning(f"AOI outline failed: {e}")
+def resolve_aoi():
+    """Use user-drawn ROI if available (leafmap stores it on rerun), else default."""
+    try:
+        roi = getattr(m, "user_roi", None)
+        if roi:
+            return ee.Geometry(roi)
+    except Exception:
+        pass
+    return ee_aoi_default
 
-# -------------------- Sentinel-2 base and indices --------------------
-def s2_median(aoi_geom, start_str, end_str, cloud_max):
+# Helper datasets & functions
+def s2_collection(aoi_geom, start_str, end_str, cloud_max):
     return (ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
             .filterDate(start_str, end_str)
             .filterBounds(aoi_geom)
-            .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", int(cloud_max)))
-            .median())
+            .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", int(cloud_max))))
 
-s2 = None
-ndvi = None
-ndwi = None
-try:
-    s2 = s2_median(aoi, str(start_date), str(end_date), cloud_thresh)
-except Exception as e:
-    st.warning(f"S2 retrieval failed: {e}")
+def s2_median(aoi_geom, start_str, end_str, cloud_max):
+    return s2_collection(aoi_geom, start_str, end_str, cloud_max).median().clip(aoi_geom)
 
-if s2 is not None:
-    if show_ndvi:
-        try:
-            ndvi = s2.normalizedDifference(["B8", "B4"]).rename("NDVI").clip(aoi)
-            ndvi_vis = {"min": 0.0, "max": 1.0, "palette": ["#8b4513", "#ffff00", "#00ff00"]}
-            m.add_ee_layer(ndvi, ndvi_vis, f"NDVI {start_date}→{end_date}")
-        except Exception as e:
-            st.warning(f"NDVI layer failed: {e}")
+def s1_collection(aoi_geom, start_str, end_str):
+    return (ee.ImageCollection("COPERNICUS/S1_GRD")
+            .filterDate(start_str, end_str)
+            .filterBounds(aoi_geom)
+            .filter(ee.Filter.eq("instrumentMode", "IW"))
+            .filter(ee.Filter.listContains("transmitterReceiverPolarisation", "VV")))
 
-    if show_ndwi or show_water:
-        try:
-            # NDWI = (Green - NIR) / (Green + NIR) = (B3 - B8) / (B3 + B8)
-            ndwi = s2.normalizedDifference(["B3", "B8"]).rename("NDWI").clip(aoi)
-            if show_ndwi:
-                ndwi_vis = {"min": -1.0, "max": 1.0, "palette": ["#654321", "#ffffff", "#00bfff"]}
-                m.add_ee_layer(ndwi, ndwi_vis, f"NDWI {start_date}→{end_date}")
-            if show_water:
-                water = ndwi.gt(0.2).selfMask()
-                water_vis = {"palette": ["#00aaff"]}
-                m.add_ee_layer(water, water_vis, "Water Mask (NDWI>0.2)")
-        except Exception as e:
-            st.warning(f"NDWI/Water layer failed: {e}")
+def s1_mean_vv(aoi_geom, start_str, end_str):
+    return s1_collection(aoi_geom, start_str, end_str).mean().clip(aoi_geom).select("VV")
 
-# -------------------- Sentinel-1 SAR --------------------
-sar_vv_img = None
-if show_sar_vv:
+def get_cdl_year_image(aoi_geom, year):
+    return (ee.ImageCollection("USDA/NASS/CDL")
+            .filterDate(f"{year}-01-01", f"{year}-12-31")
+            .first()
+            .select("cropland")
+            .clip(aoi_geom))
+
+def soil_texture_12(aoi_geom):
+    return ee.Image("OpenLandMap/SOL/SOL_TEXTURE-CLASS_USDA-12A1C_M/v02").select("b0").clip(aoi_geom)
+
+def reduce_stats(image, geom, scale=10):
+    reducer = (ee.Reducer.mean()
+               .combine(ee.Reducer.stdDev(), sharedInputs=True)
+               .combine(ee.Reducer.percentile([10, 50, 90]), sharedInputs=True))
+    return image.reduceRegion(reducer=reducer, geometry=geom, scale=scale, bestEffort=True, maxPixels=1e9)
+
+def compute_water_pct(ndwi_img, geom, thresh=0.2, scale=10):
+    water = ndwi_img.gt(thresh)
+    area_img = ee.Image.pixelArea()
+    w = area_img.updateMask(water).reduceRegion(ee.Reducer.sum(), geom, scale, bestEffort=True)
+    a = area_img.reduceRegion(ee.Reducer.sum(), geom, scale, bestEffort=True)
     try:
-        s1 = (ee.ImageCollection("COPERNICUS/S1_GRD")
-              .filterDate(str(start_date), str(end_date))
-              .filterBounds(aoi)
-              .filter(ee.Filter.eq("instrumentMode", "IW"))
-              .filter(ee.Filter.listContains("transmitterReceiverPolarisation", "VV"))
-              .mean()
-              .clip(aoi))
-        sar_vv_img = s1.select("VV")
-        sar_vv_vis = {"min": -20, "max": -2}
-        m.add_ee_layer(sar_vv_img, sar_vv_vis, f"SAR VV {start_date}→{end_date}")
-    except Exception as e:
-        st.warning(f"SAR VV failed: {e}")
+        w_val = (w.getInfo() or {}).get("area", None)
+        a_val = (a.getInfo() or {}).get("area", None)
+        if w_val and a_val and a_val > 0:
+            return round(100.0 * float(w_val) / float(a_val), 2)
+    except Exception:
+        pass
+    return None
 
-# -------------------- Fallow + Crops (CDL) --------------------
+def compute_cdl_histogram(cdl_img, geom, scale=30):
+    try:
+        hist = cdl_img.reduceRegion(ee.Reducer.frequencyHistogram(), geom, scale, bestEffort=True).get("cropland").getInfo()
+        return hist or {}
+    except Exception:
+        return {}
+
+def cdl_names_lookup(cdl_img):
+    try:
+        props = (cdl_img.getInfo() or {}).get("properties", {})
+        values = props.get("cropland_class_values") or props.get("Class_values")
+        names = props.get("cropland_class_names") or props.get("Class_names")
+        if values and names and len(values) == len(names):
+            return {int(v): n for v, n in zip(values, names)}
+    except Exception:
+        pass
+    return {}
+
+# Erosion risk (relative): risk = normalize( S * K * C )
+def erosion_risk_layer(aoi_geom, ndvi_img):
+    # S factor from slope (SRTM 30 m)
+    dem = ee.Image("USGS/SRTMGL1_003").clip(aoi_geom)
+    slope_deg = ee.Terrain.slope(dem)  # degrees
+    theta = slope_deg.multiply(math.pi / 180.0).sin()
+    # 9% slope threshold in degrees (~5.14°)
+    s_low = theta.multiply(10.8).add(0.03)
+    s_high = theta.multiply(16.8).subtract(0.50)
+    S = s_low.where(slope_deg.gte(ee.Image.constant(5.14)), s_high).rename("S").max(0)
+
+    # K factor from USDA 12-class texture (approximate typical K values)
+    # 1..12 -> K in [0.02..0.40] (typical RUSLE K t·ha·h/ha·MJ·mm range; scaled)
+    tex = soil_texture_12(aoi_geom)
+    k_values = [0.28,0.20,0.15,0.32,0.38,0.40,0.25,0.22,0.26,0.17,0.20,0.15]  # generic mapping by class index
+    K = tex.remap(list(range(1,13)), k_values).rename("K")
+
+    # C factor from NDVI (more cover => lower C). Simple proxy: C = 1 - NDVI
+    ndvi_clamped = ndvi_img.where(ndvi_img.lt(0), 0).where(ndvi_img.gt(1), 1)
+    C = ee.Image(1).subtract(ndvi_clamped).rename("C")
+
+    risk = S.multiply(K).multiply(C).rename("risk")
+    # Normalize by 95th percentile within AOI -> 0..1
+    p95 = ee.Number(risk.reduceRegion(ee.Reducer.percentile([95]), aoi_geom, 30, bestEffort=True).get("risk"))
+    risk_norm = risk.divide(p95.max(ee.Number(1e-6))).clamp(0, 1).rename("risk")
+
+    return risk_norm
+
+# Resolve AOI (user-drawn on previous interaction), then build layers
+AOI = resolve_aoi()
+
+# Image counts (debug so you know data exists)
+try:
+    s2_count = int(s2_collection(AOI, str(start_date), str(end_date), cloud_thresh).size().getInfo())
+except Exception:
+    s2_count = 0
+try:
+    s1_count = int(s1_collection(AOI, str(start_date), str(end_date)).size().getInfo())
+except Exception:
+    s1_count = 0
+
+st.sidebar.caption(f"🛰️ S2 scenes found: {s2_count}")
+st.sidebar.caption(f"📡 S1 (SAR) scenes found: {s1_count}")
+
+s2_img = None
+ndvi_img = None
+ndwi_img = None
+sar_vv_img = None
 cdl_img = None
+
+# Sentinel-2 composite & indices
+if s2_count > 0:
+    try:
+        s2_img = s2_median(AOI, str(start_date), str(end_date), cloud_thresh)
+    except Exception as e:
+        st.warning(f"S2 retrieval failed: {e}")
+
+if s2_img is not None and show_ndvi:
+    try:
+        ndvi_img = s2_img.normalizedDifference(["B8", "B4"]).rename("NDVI")
+        m.add_ee_layer(
+            ndvi_img, {"min": 0.0, "max": 1.0, "palette": ["#8b4513", "#ffff00", "#00ff00"], "opacity": 0.8},
+            f"NDVI {start_date}→{end_date}",
+        )
+    except Exception as e:
+        st.warning(f"NDVI layer failed: {e}")
+elif show_ndvi and s2_count == 0:
+    st.warning("No Sentinel-2 images in this window/AOI. Widen the dates or reduce cloud %.")
+
+if s2_img is not None and (show_ndwi or show_water):
+    try:
+        ndwi_img = s2_img.normalizedDifference(["B3", "B8"]).rename("NDWI")
+        if show_ndwi:
+            m.add_ee_layer(
+                ndwi_img, {"min": -1.0, "max": 1.0, "palette": ["#654321", "#ffffff", "#00bfff"], "opacity": 0.7},
+                f"NDWI {start_date}→{end_date}",
+            )
+        if show_water:
+            water = ndwi_img.gt(0.2).selfMask()
+            m.add_ee_layer(water, {"palette": ["#00aaff"], "opacity": 0.9}, "Water mask (NDWI>0.2)")
+    except Exception as e:
+        st.warning(f"NDWI/Water layer failed: {e}")
+
+# Sentinel-1 SAR VV
+if show_sar_vv:
+    if s1_count == 0:
+        st.warning("No Sentinel-1 scenes in this window/AOI.")
+    else:
+        try:
+            sar_vv_img = s1_mean_vv(AOI, str(start_date), str(end_date))
+            m.add_ee_layer(sar_vv_img, {"min": -20, "max": -2, "opacity": 0.75}, f"SAR VV {start_date}→{end_date}")
+        except Exception as e:
+            st.warning(f"SAR VV failed: {e}")
+
+# Fallow + Crops (CDL)
 if show_fallow or show_cdl:
     try:
         year = end_date.year
-        cdl_img = (ee.ImageCollection("USDA/NASS/CDL")
-                   .filterDate(f"{year}-01-01", f"{year}-12-31")
-                   .first()
-                   .select("cropland")
-                   .clip(aoi))
+        cdl_img = get_cdl_year_image(AOI, year)
         if show_fallow:
-            # CDL class 61 = Fallow/Idle Cropland
-            fallow = cdl_img.eq(61).selfMask()
-            m.add_ee_layer(fallow, {"palette": ["#ff8800"]}, f"Fallow (CDL {year})")
-
+            fallow = cdl_img.eq(61).selfMask()  # 61 = Fallow/Idle cropland
+            m.add_ee_layer(fallow, {"palette": ["#ff8800"], "opacity": 0.85}, f"Fallow (CDL {year})")
         if show_cdl:
-            try:
-                codes = [int(v.strip()) for v in cdl_codes_text.split(",") if v.strip()]
-            except Exception:
-                codes = []
-            colors = ["#ff0000","#00ff00","#0000ff","#ffff00","#ff00ff","#00ffff","#ff8800","#8800ff","#00ff88","#888888"]
-            for i, code in enumerate(codes[:10]):  # cap to 10 layers for perf
-                mask = cdl_img.eq(code).selfMask()
-                m.add_ee_layer(mask, {"palette": [colors[i % len(colors)]]}, f"CDL code {code} ({year})")
+            m.add_ee_layer(cdl_img.randomVisualizer(), {}, f"CDL cropland classes ({year})")
     except Exception as e:
         st.warning(f"CDL layer failed: {e}")
 
-# -------------------- Soil Texture (USDA 12-class) --------------------
+# Soil texture
 if show_soil_texture:
     try:
-        tex = ee.Image("OpenLandMap/SOL/SOL_TEXTURE-CLASS_USDA-12A1C_M/v02").select("b0").clip(aoi)
-        # 12-class palette (single line to prevent wrapping issues)
+        tex = soil_texture_12(AOI)
         palette12 = ["#fef0d9","#fdcc8a","#fc8d59","#e34a33","#b30000","#31a354","#2b8cbe","#a6bddb","#1c9099","#c7e9b4","#7fcdbb","#df65b0"]
-        m.add_ee_layer(tex, {"min": 1, "max": 12, "palette": palette12}, "Soil Texture (USDA 12)")
+        m.add_ee_layer(tex, {"min": 1, "max": 12, "palette": palette12, "opacity": 0.7}, "Soil texture (USDA 12)")
     except Exception as e:
         st.warning(f"Soil texture layer failed: {e}")
+
+# Erosion risk (relative)
+risk_img = None
+if show_erosion:
+    if ndvi_img is None:
+        st.info("Enable NDVI to compute erosion risk (uses current cover).")
+    else:
+        try:
+            risk_img = erosion_risk_layer(AOI, ndvi_img)
+            risk_vis = {"min": 0, "max": 1, "palette": ["#ffffb2","#fecc5c","#fd8d3c","#f03b20","#bd0026"], "opacity": 0.85}
+            m.add_ee_layer(risk_img, risk_vis, "Erosion risk (relative)")
+        except Exception as e:
+            st.warning(f"Erosion risk layer failed: {e}")
+
+# Layer control so you can toggle visibility on-map
+try:
+    m.add_layer_control()
+except Exception:
+    try:
+        m.add_layers_control()
+    except Exception:
+        pass
 
 # Render map
 m.to_streamlit(height=600)
 
-# ---------------------------------------------------------------------
-# Stats, time-series, export
-# ---------------------------------------------------------------------
-def reduce_stats(image, geom, scale=10):
-    reducer = (
-        ee.Reducer.mean()
-        .combine(ee.Reducer.stdDev(), sharedInputs=True)
-        .combine(ee.Reducer.percentile([10, 50, 90]), sharedInputs=True)
-    )
-    vals = image.reduceRegion(reducer=reducer, geometry=geom, scale=scale, bestEffort=True, maxPixels=1e9)
-    return vals
-
-@st.cache_data(show_spinner=False)
-def compute_ndvi_timeseries(aoi_geom, start_str, end_str, cloud_max, limit_n):
-    import ee
-    s2 = (ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
-          .filterDate(start_str, end_str)
-          .filterBounds(aoi_geom)
-          .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", int(cloud_max)))
-          .sort("system:time_start")
-          .limit(int(limit_n)))
-
-    def per_img(img):
-        nd = img.normalizedDifference(["B8", "B4"]).rename("NDVI")
-        mean = nd.reduceRegion(ee.Reducer.mean(), aoi_geom, 10, bestEffort=True)
-        return ee.Feature(None, {"date": img.date().format("YYYY-MM-dd"), "ndvi": mean.get("NDVI")})
-
-    fc = ee.FeatureCollection(s2.map(per_img))
-    feats = fc.getInfo().get("features", [])
-    rows = [{"date": f["properties"]["date"], "ndvi": f["properties"]["ndvi"]}
-            for f in feats if f.get("properties", {}).get("ndvi") is not None]
-    df = pd.DataFrame(rows)
-    if len(df) == 0:
-        return df
-    df["date"] = pd.to_datetime(df["date"])
-    df = df.sort_values("date")
-    return df
-
-c1, c2 = st.columns([1, 1])
-
-with c1:
-    st.subheader("AOI Summary")
-    if ndvi is None:
-        st.info("Turn on NDVI to compute stats and export.")
-    else:
-        if compute_btn:
-            try:
-                vals_dict = reduce_stats(ndvi, aoi, scale=10).getInfo()
-            except Exception as e:
-                st.error(f"Stats failed: {e}")
-                vals_dict = None
-
-            water_pct = None
-            if show_water and (ndwi is not None):
-                try:
-                    water = ndwi.gt(0.2)
-                    area_img = ee.Image.pixelArea()
-                    water_area_dict = area_img.updateMask(water).reduceRegion(ee.Reducer.sum(), aoi, 10, bestEffort=True).getInfo()
-                    aoi_area_dict = area_img.reduceRegion(ee.Reducer.sum(), aoi, 10, bestEffort=True).getInfo()
-                    w = (water_area_dict or {}).get("area")
-                    a = (aoi_area_dict or {}).get("area")
-                    if w and a and a > 0:
-                        water_pct = round(100.0 * float(w) / float(a), 2)
-                except Exception:
-                    water_pct = None
-
-            rows = []
-            if vals_dict:
-                rows.append(["Mean NDVI", round(float(vals_dict.get("NDVI_mean", float("nan"))), 3)])
-                rows.append(["StdDev NDVI", round(float(vals_dict.get("NDVI_stdDev", float("nan"))), 3)])
-                rows.append(["P10 NDVI", round(float(vals_dict.get("NDVI_p10", float("nan"))), 3)])
-                rows.append(["Median NDVI", round(float(vals_dict.get("NDVI_p50", float("nan"))), 3)])
-                rows.append(["P90 NDVI", round(float(vals_dict.get("NDVI_p90", float("nan"))), 3)])
-            rows.append(["AOI Area (ha)", round(area_m2 / 10000.0, 2)])
-            if water_pct is not None:
-                rows.append(["Water % (NDWI>0.2)", water_pct])
-
-            st.table(pd.DataFrame(rows, columns=["Metric", "Value"]))
-
-        st.markdown("### Export")
-        if st.button("Generate NDVI GeoTIFF download URL"):
-            try:
-                ndvi_scaled = ndvi.toFloat().multiply(10000).toInt16()
-                url = ndvi_scaled.getDownloadURL({"scale": 10, "region": aoi, "crs": "EPSG:4326", "format": "GEO_TIFF"})
-                st.success("NDVI GeoTIFF URL ready:")
-                st.write(f"[Download NDVI (GeoTIFF)]({url})")
-            except Exception as e:
-                st.error(f"Export URL failed: {e}")
-
-with c2:
-    st.subheader("NDVI Time-Series")
-    if st.button("Build NDVI time-series"):
+# ─────────────────────────────────────────────────────────────────────
+# Quick previews (ensure you can SEE the data regardless of tile cache)
+# ─────────────────────────────────────────────────────────────────────
+with st.expander("Quick previews (NDVI / NDWI / SAR)"):
+    cols = st.columns(3)
+    if ndvi_img is not None:
         try:
-            df = compute_ndvi_timeseries(aoi, str(start_date), str(end_date), cloud_thresh, max_imgs)
-            if df.empty:
-                st.info("No valid NDVI samples found. Try widening the date range or lowering the cloud filter.")
-            else:
-                st.dataframe(df, use_container_width=True, hide_index=True)
-                chart = alt.Chart(df).mark_line().encode(
-                    x=alt.X("date:T", title="Date"),
-                    y=alt.Y("ndvi:Q", title="NDVI", scale=alt.Scale(domain=[0, 1])),
-                    tooltip=["date:T", alt.Tooltip("ndvi:Q", format=".3f")]
-                ).properties(height=220)
-                st.altair_chart(chart, use_container_width=True)
-
-                # Data citation under the chart
-                try:
-                    latest_scene = df["date"].max().strftime("%Y-%m-%d")
-                except Exception:
-                    latest_scene = "n/a"
-                pulled_on = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-                st.caption(
-                    f"Data pulled: {pulled_on} • Latest NDVI scene: {latest_scene} • "
-                    f"Window: {start_date}→{end_date} • Max images: {max_imgs}"
-                )
-        except Exception as e:
-            st.error(f"Time-series failed: {e}")
-
-# ---------------------------------------------------------------------
-# Sidebar AI assistant (optional)
-# ---------------------------------------------------------------------
-st.sidebar.markdown("---")
-st.sidebar.header("🤖 AI Assistant")
-assistant_ready = bool(os.getenv("OPENAI_API_KEY", "").strip())
-user_q = st.sidebar.text_area("Ask about your data, agronomy, or remote sensing…", height=100)
-if st.sidebar.button("Ask"):
-    if not assistant_ready:
-        st.sidebar.error("Set OPENAI_API_KEY in Render → Environment to enable the assistant.")
-    elif not user_q.strip():
-        st.sidebar.info("Type a question first.")
-    else:
-        try:
-            from openai import OpenAI
-            client = OpenAI()
-            context_bits = []
-            # Add any computed context we already have
-            try:
-                if 'vals_dict' in locals() and isinstance(vals_dict, dict) and vals_dict:
-                    context_bits.append(
-                        f"NDVI stats: mean={vals_dict.get('NDVI_mean')}, p50={vals_dict.get('NDVI_p50')}, p90={vals_dict.get('NDVI_p90')}"
-                    )
-            except Exception:
-                pass
-            # You can add more context here if desired
-            context = "; ".join(context_bits) if context_bits else "No computed context yet."
-
-            prompt = (
-                f"You are an agronomy & remote sensing assistant.\n"
-                f"AOI center=({lat},{lon}) size_ha={size_ha}. Date window {start_date}..{end_date}.\n"
-                f"Context: {context}\n"
-                f"Question: {user_q}\n"
-                f"Keep answers concise and actionable for a grower/advisor in California."
-            )
-            resp = client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {"role": "system", "content": "You are a helpful agronomy and remote sensing expert."},
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=0.2,
-                max_tokens=600,
-            )
-            st.sidebar.success(resp.choices[0].message.content.strip())
-        except Exception as e:
-            st.sidebar.error(f"Assistant error: {e}")
-
-# Footer
-st.markdown(
-    "<div style='opacity:.75;font-size:0.9rem;margin-top:1rem'>"
-    "Overlays: NDVI/NDWI/SAR, Water (NDWI>0.2), Fallow (CDL), user-specified CDL crop codes, Soil Texture (USDA 12). "
-    "Use the map layer control to toggle visibility. "
-    "Tip: adjust AOI center/size to fit your field boundary."
-    "</div>",
-    unsafe_allow_html=True,
-)
+            url = ndvi_img.getThumbURL({"region": AOI, "scale": 10, "min": 0, "_
