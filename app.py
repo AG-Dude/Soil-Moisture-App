@@ -74,25 +74,22 @@ def ee_init():
 ee = ee_init()
 
 # ─────────────────────────────────────────────────────────────────────
-# Imports that depend on installed libs
+# Map libs
 # ─────────────────────────────────────────────────────────────────────
 try:
-    # Use folium + streamlit-folium for robust event handling
     import folium
-    from folium.plugins import Draw, Fullscreen, MousePosition
+    from folium.plugins import Draw, Fullscreen
     from streamlit_folium import st_folium
 except Exception as e:
     st.error("Missing dependencies for map UI. Add to requirements.txt:\n"
-             "streamlit-folium==0.22.0\nfolium==0.16.0\n\nError: " + str(e))
+             "folium==0.16.0\nstreamlit-folium==0.22.0\n\nError: " + str(e))
     st.stop()
 
+# Only for geocoding (address → lat/lon). We do NOT use its tile helpers.
 try:
-    # We still use leafmap just to build EE tile layers
     import leafmap
-    import leafmap.foliumap as leafmap_f
-except Exception as e:
-    st.error(f"Leafmap import failed: {e}. Pin leafmap==0.50.0.")
-    st.stop()
+except Exception:
+    leafmap = None
 
 # ─────────────────────────────────────────────────────────────────────
 # Session state defaults
@@ -103,14 +100,14 @@ def default_center():
 def default_aoi_box(center_lat, center_lon, half_m=400):
     lat_deg = half_m / 110540.0
     lon_deg = half_m / (111320.0 * max(0.0001, math.cos(math.radians(center_lat))))
-    coords = [
+    ring = [
         [center_lon - lon_deg, center_lat - lat_deg],
         [center_lon - lon_deg, center_lat + lat_deg],
         [center_lon + lon_deg, center_lat + lat_deg],
         [center_lon + lon_deg, center_lat - lat_deg],
         [center_lon - lon_deg, center_lat - lat_deg],
     ]
-    return {"type": "Polygon", "coordinates": [coords + [coords[0]]]}
+    return {"type": "Polygon", "coordinates": [ring]}
 
 if "center" not in st.session_state:
     st.session_state["center"] = default_center()
@@ -132,6 +129,8 @@ with c3:
 
 if go and address.strip():
     try:
+        if leafmap is None:
+            raise RuntimeError("leafmap not installed for geocoding")
         latlon = leafmap.geocode(address)  # returns (lat, lon)
         if isinstance(latlon, (list, tuple)) and len(latlon) == 2:
             clat, clon = float(latlon[0]), float(latlon[1])
@@ -172,7 +171,6 @@ with st.sidebar:
     st.divider()
     if st.button("Force refresh tiles & cache"):
         st.cache_data.clear()
-        # also bump a cache-buster
         st.session_state["cachebust"] = int(time.time())
         st.experimental_rerun()
 
@@ -276,14 +274,42 @@ def dynamic_sar_vis(img, geom):
     return {"min": vmin, "max": vmax, "opacity": 0.75}
 
 # ─────────────────────────────────────────────────────────────────────
-# Build folium map with overlays and draw tools
+# EE → Folium tile helper (NO leafmap.foliumap dependency)
 # ─────────────────────────────────────────────────────────────────────
 def ee_tilelayer(image, vis, name):
-    """Get a folium TileLayer for an EE image, with a cache-buster to avoid stale tiles."""
-    t = int(time.time())  # cache-bust per rerun
-    layer = leafmap_f.ee_tile_layer(image, vis, f"{name} {t}")
-    return layer
+    """Return a folium TileLayer for an EE image."""
+    import ee
+    try:
+        m = ee.Image(image).getMapId(vis)
+        # Prefer new-style tile_fetcher if present
+        tile_url = None
+        tf = m.get("tile_fetcher")
+        if tf is not None:
+            try:
+                tile_url = tf.url_format  # geemap/ee support
+            except Exception:
+                tile_url = None
+        if tile_url is None:
+            # Fallback to classic pattern
+            tile_url = f"https://earthengine.googleapis.com/map/{m['mapid']}/{{z}}/{{x}}/{{y}}?token={m['token']}"
+        # Cache-bust so toggles & AOI changes refresh
+        tile_url = tile_url + f"&ts={int(time.time())}"
+        opacity = float(vis.get("opacity", 1.0)) if isinstance(vis, dict) else 1.0
+        return folium.TileLayer(
+            tiles=tile_url,
+            attr="Google Earth Engine",
+            name=name,
+            overlay=True,
+            control=True,
+            opacity=opacity,
+        )
+    except Exception as e:
+        st.warning(f"Failed to build EE tile for '{name}': {e}")
+        return None
 
+# ─────────────────────────────────────────────────────────────────────
+# Build folium map with overlays and draw tools
+# ─────────────────────────────────────────────────────────────────────
 def build_map_and_layers():
     AOI = ee_aoi()
     clat, clon = st.session_state["center"]
@@ -297,7 +323,7 @@ def build_map_and_layers():
 
     Fullscreen().add_to(fmap)
 
-    # Draw tools: rectangle (AOI) + marker (sampling). Disable polygon freehand to avoid accidental AOI changes.
+    # Draw tools: rectangle (AOI) + marker (sampling)
     Draw(
         draw_options={
             "polyline": False,
@@ -314,7 +340,8 @@ def build_map_and_layers():
     try:
         import ee
         aoi_outline = ee.Image().byte().paint(AOI, 1, 2).visualize(palette=["#00FFFF"])
-        ee_tilelayer(aoi_outline, {}, "AOI outline").add_to(fmap)
+        layer = ee_tilelayer(aoi_outline, {}, "AOI outline")
+        if layer: layer.add_to(fmap)
     except Exception:
         pass
 
@@ -345,11 +372,12 @@ def build_map_and_layers():
     if s2_img is not None and show_ndvi:
         try:
             ndvi_img = s2_img.normalizedDifference(["B8", "B4"]).rename("NDVI")
-            ee_tilelayer(
+            layer = ee_tilelayer(
                 ndvi_img,
                 {"min": 0, "max": 1, "palette": ["#8b4513","#ffff00","#00ff00"], "opacity": 0.8},
                 f"NDVI {start_date}→{end_date}"
-            ).add_to(fmap)
+            )
+            if layer: layer.add_to(fmap)
         except Exception as e:
             st.warning(f"NDVI layer failed: {e}")
 
@@ -357,23 +385,24 @@ def build_map_and_layers():
         try:
             ndwi_img = s2_img.normalizedDifference(["B3", "B8"]).rename("NDWI")
             if show_ndwi:
-                ee_tilelayer(
+                layer = ee_tilelayer(
                     ndwi_img,
                     {"min": -1, "max": 1, "palette": ["#654321","#ffffff","#00bfff"], "opacity": 0.7},
                     f"NDWI {start_date}→{end_date}"
-                ).add_to(fmap)
+                )
+                if layer: layer.add_to(fmap)
             if show_water:
                 water = ndwi_img.gt(0.2).selfMask()
-                ee_tilelayer(water, {"palette": ["#00aaff"], "opacity": 0.9}, "Water mask (NDWI>0.2)").add_to(fmap)
+                layer = ee_tilelayer(water, {"palette": ["#00aaff"], "opacity": 0.9}, "Water mask (NDWI>0.2)")
+                if layer: layer.add_to(fmap)
         except Exception as e:
             st.warning(f"NDWI/Water layer failed: {e}")
 
     if show_sar_vv and s1_count > 0:
         try:
             sar_vv_img = s1_mean_vv(AOI, str(start_date), str(end_date))
-            ee_tilelayer(
-                sar_vv_img, dynamic_sar_vis(sar_vv_img, AOI), f"SAR VV {start_date}→{end_date}"
-            ).add_to(fmap)
+            layer = ee_tilelayer(sar_vv_img, dynamic_sar_vis(sar_vv_img, AOI), f"SAR VV {start_date}→{end_date}")
+            if layer: layer.add_to(fmap)
         except Exception as e:
             st.warning(f"SAR VV failed: {e}")
 
@@ -384,22 +413,25 @@ def build_map_and_layers():
                 palette12 = ["#fef0d9","#fdcc8a","#fc8d59","#e34a33","#b30000",
                              "#31a354","#2b8cbe","#a6bddb","#1c9099","#c7e9b4",
                              "#7fcdbb","#df65b0"]
-                ee_tilelayer(tex, {"min": 1, "max": 12, "palette": palette12, "opacity": 0.7},
-                             "Soil texture (USDA 12)").add_to(fmap)
+                layer = ee_tilelayer(tex, {"min": 1, "max": 12, "palette": palette12, "opacity": 0.7},
+                                     "Soil texture (USDA 12)")
+                if layer: layer.add_to(fmap)
             if show_soil_boundaries:
                 edges = soil_texture_edges(tex)
-                ee_tilelayer(edges, {"palette": ["#ff00ff"], "opacity": 0.9}, "Soil boundaries").add_to(fmap)
+                layer = ee_tilelayer(edges, {"palette": ["#ff00ff"], "opacity": 0.9}, "Soil boundaries")
+                if layer: layer.add_to(fmap)
         except Exception as e:
             st.warning(f"Soil layers failed: {e}")
 
     if show_erosion and s2_img is not None:
         try:
             risk_img = erosion_risk_layer(AOI, s2_img.normalizedDifference(["B8", "B4"]).rename("NDVI"))
-            ee_tilelayer(
+            layer = ee_tilelayer(
                 risk_img, {"min": 0, "max": 1,
                            "palette": ["#ffffb2","#fecc5c","#fd8d3c","#f03b20","#bd0026"], "opacity": 0.85},
                 "Erosion risk (relative)"
-            ).add_to(fmap)
+            )
+            if layer: layer.add_to(fmap)
         except Exception as e:
             st.warning(f"Erosion risk failed: {e}")
 
@@ -411,7 +443,7 @@ def build_map_and_layers():
         width=None,
         height=600,
         returned_objects=["last_active_drawing", "all_drawings", "last_drawn_feature", "last_clicked"],
-        key=f"map_{int(time.time())}"  # bust streamlit widget cache per rerun so layers refresh
+        key=f"map_{int(time.time())}"  # bump widget key so tiles refresh when state changes
     )
 
     # Status bar
@@ -443,7 +475,6 @@ def extract_draw(out):
     new_aoi = None
     sample_pt = None
 
-    # Prefer explicit last_drawn_feature
     for key in ("last_drawn_feature", "last_active_drawing"):
         geom = _get_geom_from_feature(out.get(key)) if isinstance(out, dict) else None
         if geom:
@@ -454,7 +485,6 @@ def extract_draw(out):
             if t == "Point":
                 sample_pt = geom
 
-    # Scan all_drawings for newest
     if isinstance(out, dict):
         all_drawings = out.get("all_drawings") or []
         for feat in reversed(all_drawings[-5:]):
@@ -619,7 +649,7 @@ try:
     if ts_df.empty:
         st.info("No valid NDVI samples in this window. Try broadening the date range or raising cloud %.")
     else:
-        st.dataframe(ts_df, use_container_width=True, hide_index=True)
+        st.dataframe(ts_df, use_column_width=True, hide_index=True)
         chart = alt.Chart(ts_df).mark_line().encode(
             x=alt.X("date:T", title="Date"),
             y=alt.Y("ndvi:Q", title="NDVI", scale=alt.Scale(domain=[0, 1])),
