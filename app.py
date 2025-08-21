@@ -14,7 +14,7 @@ import pandas as pd
 st.set_page_config(layout="wide", page_title="🛰️ Soil Scout")
 
 st.title("🛰️ Soil Scout")
-st.caption("NDVI • NDWI • SAR • Water • Fallow (CDL) • Soil Texture • Erosion Risk | AOI stats, time-series, export, AI helper")
+st.caption("NDVI • NDWI • SAR ")
 st.caption(f"Python runtime: {sys.version}")
 
 # ─────────────────────────────────────────────────────────────────────
@@ -359,4 +359,222 @@ with st.expander("Quick previews (NDVI / NDWI / SAR)"):
     cols = st.columns(3)
     if ndvi_img is not None:
         try:
-            url = ndvi_img.getThumbURL({"region": AOI, "scale": 10, "min": 0, "_
+            url = ndvi_img.getThumbURL({"region": AOI, "scale": 10, "min": 0, "max": 1, "palette": ["#8b4513","#ffff00","#00ff00"]})
+            cols[0].image(url, caption="NDVI preview", use_column_width=True)
+        except Exception:
+            pass
+    if ndwi_img is not None:
+        try:
+            url = ndwi_img.getThumbURL({"region": AOI, "scale": 10, "min": -1, "max": 1, "palette": ["#654321","#ffffff","#00bfff"]})
+            cols[1].image(url, caption="NDWI preview", use_column_width=True)
+        except Exception:
+            pass
+    if sar_vv_img is not None:
+        try:
+            url = sar_vv_img.getThumbURL({"region": AOI, "scale": 20, "min": -20, "max": -2})
+            cols[2].image(url, caption="SAR VV preview", use_column_width=True)
+        except Exception:
+            pass
+
+# ─────────────────────────────────────────────────────────────────────
+# AOI Summary (NDVI stats, area, water %, erosion risk rating)
+# ─────────────────────────────────────────────────────────────────────
+st.subheader("AOI summary")
+
+rows = []
+
+# AOI area (ha)
+try:
+    area_ha_px = ee.Image.pixelArea().reduceRegion(ee.Reducer.sum(), AOI, 10, bestEffort=True).getInfo().get("area", None)
+    if area_ha_px:
+        rows.append(["AOI Area (ha)", round(float(area_ha_px) / 10000.0, 2)])
+except Exception:
+    pass
+
+vals_dict = None
+if ndvi_img is not None:
+    try:
+        vals_dict = reduce_stats(ndvi_img, AOI, scale=10).getInfo()
+    except Exception:
+        vals_dict = None
+    if vals_dict:
+        rows.extend([
+            ["Mean NDVI", round(float(vals_dict.get("NDVI_mean", float("nan"))), 3)],
+            ["StdDev NDVI", round(float(vals_dict.get("NDVI_stdDev", float("nan"))), 3)],
+            ["P10 NDVI", round(float(vals_dict.get("NDVI_p10", float("nan"))), 3)],
+            ["Median NDVI", round(float(vals_dict.get("NDVI_p50", float("nan"))), 3)],
+            ["P90 NDVI", round(float(vals_dict.get("NDVI_p90", float("nan"))), 3)],
+        ])
+
+if ndwi_img is not None and show_water:
+    water_pct = compute_water_pct(ndwi_img, AOI, thresh=0.2, scale=10)
+    if water_pct is not None:
+        rows.append(["Water % (NDWI>0.2)", water_pct])
+
+# Erosion risk summary
+if risk_img is not None:
+    try:
+        mean_risk = risk_img.reduceRegion(ee.Reducer.mean(), AOI, 30, bestEffort=True).getInfo().get("risk", None)
+        if mean_risk is not None:
+            rating = "Low"
+            if mean_risk >= 0.66:
+                rating = "High"
+            elif mean_risk >= 0.33:
+                rating = "Moderate"
+            rows.append(["Erosion risk (0–1)", round(float(mean_risk), 2)])
+            rows.append(["Erosion rating", rating])
+    except Exception:
+        pass
+
+if rows:
+    st.table(pd.DataFrame(rows, columns=["Metric", "Value"]))
+else:
+    st.info("Draw an AOI and enable NDVI/NDWI to see summary metrics.")
+
+# CDL crop breakdown (top 5 classes by area)
+if show_cdl or show_fallow:
+    pass  # already visualized
+# We still try summarizing CDL even if not toggled
+try:
+    if cdl_img is None:
+        cdl_img = get_cdl_year_image(AOI, end_date.year)
+    hist = compute_cdl_histogram(cdl_img, AOI, scale=30)
+    if hist:
+        code2name = cdl_names_lookup(cdl_img)
+        total = sum(hist.values())
+        items = []
+        for code, count in hist.items():
+            try:
+                code_int = int(code)
+            except Exception:
+                continue
+            pct = 100.0 * float(count) / float(total) if total else 0.0
+            name = code2name.get(code_int, f"Class {code_int}")
+            items.append((pct, code_int, name))
+        items.sort(reverse=True)
+        top = items[:5]
+        df_top = pd.DataFrame(
+            [{"Rank": i+1, "CDL Code": c, "Class": name, "Percent": round(pct, 2)} for i, (pct, c, name) in enumerate(top)]
+        )
+        st.markdown("**Likely crops/land cover in AOI (CDL, top 5)**")
+        st.dataframe(df_top, use_container_width=True, hide_index=True)
+except Exception:
+    pass
+
+# NDVI time-series
+@st.cache_data(show_spinner=False)
+def compute_ndvi_timeseries(aoi_geom, start_str, end_str, cloud_max, limit_n):
+    import ee
+    s2 = (ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+          .filterDate(start_str, end_str)
+          .filterBounds(aoi_geom)
+          .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", int(cloud_max)))
+          .sort("system:time_start")
+          .limit(int(limit_n)))
+    def per_img(img):
+        nd = img.normalizedDifference(["B8", "B4"]).rename("NDVI")
+        mean = nd.reduceRegion(ee.Reducer.mean(), aoi_geom, 10, bestEffort=True)
+        return ee.Feature(None, {"date": img.date().format("YYYY-MM-dd"), "ndvi": mean.get("NDVI")})
+    fc = ee.FeatureCollection(s2.map(per_img))
+    feats = fc.getInfo().get("features", [])
+    rows = [{"date": f["properties"]["date"], "ndvi": f["properties"]["ndvi"]}
+            for f in feats if f.get("properties", {}).get("ndvi") is not None]
+    df = pd.DataFrame(rows)
+    if len(df) == 0:
+        return df
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.sort_values("date")
+    return df
+
+st.subheader("NDVI time-series")
+try:
+    ts_df = compute_ndvi_timeseries(AOI, str(start_date), str(end_date), cloud_thresh, 20)
+    if ts_df.empty:
+        st.info("No valid NDVI samples in this window. Try broadening the date range or raising cloud %.")
+    else:
+        st.dataframe(ts_df, use_container_width=True, hide_index=True)
+        chart = alt.Chart(ts_df).mark_line().encode(
+            x=alt.X("date:T", title="Date"),
+            y=alt.Y("ndvi:Q", title="NDVI", scale=alt.Scale(domain=[0, 1])),
+            tooltip=["date:T", alt.Tooltip("ndvi:Q", format=".3f")]
+        ).properties(height=220)
+        st.altair_chart(chart, use_container_width=True)
+
+        # Data citation
+        try:
+            latest_scene = ts_df["date"].max().strftime("%Y-%m-%d")
+        except Exception:
+            latest_scene = "n/a"
+        pulled_on = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        st.caption(
+            f"Data pulled: {pulled_on} • Latest NDVI scene: {latest_scene} • "
+            f"Window: {start_date}→{end_date}"
+        )
+except Exception as e:
+    st.error(f"Time-series failed: {e}")
+
+# Export NDVI GeoTIFF
+st.markdown("### Export")
+if ndvi_img is not None and st.button("Generate NDVI GeoTIFF URL"):
+    try:
+        ndvi_scaled = ndvi_img.toFloat().multiply(10000).toInt16()
+        url = ndvi_scaled.getDownloadURL({"scale": 10, "region": AOI, "crs": "EPSG:4326", "format": "GEO_TIFF"})
+        st.success("NDVI GeoTIFF URL ready:")
+        st.write(f"[Download NDVI (GeoTIFF)]({url})")
+    except Exception as e:
+        st.error(f"Export failed: {e}")
+elif ndvi_img is None:
+    st.info("Enable NDVI to export.")
+
+# ─────────────────────────────────────────────────────────────────────
+# Sidebar AI helper (optional) — can discuss crop ID, irrigation, etc.
+# ─────────────────────────────────────────────────────────────────────
+st.sidebar.markdown("---")
+st.sidebar.header("🤖 AI helper")
+assistant_ready = bool(os.getenv("OPENAI_API_KEY", "").strip())
+user_q = st.sidebar.text_area("Ask about your field, crops, irrigation, sensors, indices…", height=100)
+if st.sidebar.button("Ask"):
+    if not assistant_ready:
+        st.sidebar.error("Set OPENAI_API_KEY in Render → Environment.")
+    elif not user_q.strip():
+        st.sidebar.info("Type a question first.")
+    else:
+        try:
+            from openai import OpenAI
+            client = OpenAI()
+
+            # Build context from current stats
+            context_bits = []
+            if vals_dict:
+                context_bits.append(
+                    f"NDVI stats: mean={vals_dict.get('NDVI_mean')}, median={vals_dict.get('NDVI_p50')}, p90={vals_dict.get('NDVI_p90')}"
+                )
+            if risk_img is not None:
+                try:
+                    mean_risk = risk_img.reduceRegion(ee.Reducer.mean(), AOI, 30, bestEffort=True).getInfo().get("risk", None)
+                    if mean_risk is not None:
+                        context_bits.append(f"Erosion risk mean={round(float(mean_risk),2)}")
+                except Exception:
+                    pass
+
+            context = "; ".join(context_bits) if context_bits else "No computed context yet."
+
+            prompt = (
+                f"You are an agronomy & remote sensing assistant.\n"
+                f"Date window {start_date}..{end_date}.\n"
+                f"Context: {context}\n"
+                f"Question: {user_q}\n"
+                f"Give concise, actionable guidance for California cropping systems."
+            )
+            resp = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": "You are a helpful agronomy and remote sensing expert."},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.2,
+                max_tokens=600,
+            )
+            st.sidebar.success(resp.choices[0].message.content.strip())
+        except Exception as e:
+            st.sidebar.error(f"Assistant error: {e}")
