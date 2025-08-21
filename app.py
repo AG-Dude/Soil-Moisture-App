@@ -104,10 +104,8 @@ def safe_to_streamlit(m, height=600):
         ret = m.to_streamlit(height=height)
         return ret if ret is not None else {}
     except Exception as e:
-        # Streamlit uses StopException to abort on rerun. Leafmap re-raises it as Exception.
         if "StopException" in repr(e) or "StopException" in str(e):
             st.stop()
-        # one retry (sometimes first render gets interrupted)
         try:
             ret = m.to_streamlit(height=height)
             return ret if ret is not None else {}
@@ -192,6 +190,12 @@ with st.sidebar:
     show_soil_boundaries = st.checkbox("Soil boundaries (approx.)", False)
     show_erosion = st.checkbox("Erosion risk (relative)", False)
 
+    st.divider()
+    if st.button("Force refresh tiles & cache"):
+        st.cache_data.clear()
+        st.experimental_rerun()
+
+    st.divider()
     if st.button("Reset AOI to center box"):
         clat, clon = st.session_state["center"]
         st.session_state["aoi_geojson"] = default_aoi_box(clat, clon, half_m=box_m if "box_m" in locals() else 400)
@@ -275,20 +279,50 @@ def erosion_risk_layer(aoi_geom, ndvi_img):
     p95 = ee.Number(risk.reduceRegion(ee.Reducer.percentile([95]), aoi_geom, 30, bestEffort=True).get("risk"))
     return risk.divide(p95.max(ee.Number(1e-6))).clamp(0, 1).rename("risk")
 
+def dynamic_sar_vis(img, geom):
+    """Auto-fit SAR contrast to AOI percentiles for better visibility."""
+    import ee
+    vals = img.reduceRegion(
+        reducer=ee.Reducer.percentile([5, 95]),
+        geometry=geom,
+        scale=30,
+        bestEffort=True
+    ).getInfo() or {}
+    vmin = float(vals.get("VV_p5", -20.0))
+    vmax = float(vals.get("VV_p95", -2.0))
+    if vmax - vmin < 2.0:
+        vmin, vmax = -20.0, -2.0
+    return {"min": vmin, "max": vmax, "opacity": 0.75}
+
 # ─────────────────────────────────────────────────────────────────────
 # Map + layers
 # ─────────────────────────────────────────────────────────────────────
 def build_map_and_layers():
     AOI = ee_aoi()
     clat, clon = st.session_state["center"]
-    m = leafmap.Map(center=[clat, clon], zoom=14)
+
+    # Disable lat/lon popup so clicks don't show raw GeoJSON
+    try:
+        m = leafmap.Map(center=[clat, clon], zoom=14, latlon_control=False)
+    except TypeError:
+        # Fallback if leafmap doesn't accept latlon_control kwarg
+        m = leafmap.Map(center=[clat, clon], zoom=14)
+        try:
+            # Turn off default popup if method exists
+            if hasattr(m, "add_latlon_popup"):
+                pass  # don't add it
+        except Exception:
+            pass
+
     m.add_basemap("HYBRID")
 
-    # Rectangle drawing (simple AOI edit)
+    # Drawing: allow rectangle (AOI) and point (sampling) only
     try:
         m.add_draw_control(
-            draw_marker=False, draw_circle=False, draw_circlemarker=False,
-            draw_polyline=False, draw_rectangle=True, draw_polygon=False, edit=True, remove=True
+            draw_marker=True,   # point sampling (does NOT change AOI)
+            draw_circle=False, draw_circlemarker=False,
+            draw_polyline=False, draw_rectangle=True, draw_polygon=False,
+            edit=True, remove=True
         )
     except Exception:
         pass
@@ -350,7 +384,7 @@ def build_map_and_layers():
     if show_sar_vv and s1_count > 0:
         try:
             sar_vv_img = s1_mean_vv(AOI, str(start_date), str(end_date))
-            add_ee_image(m, sar_vv_img, {"min": -20, "max": -2, "opacity": 0.75},
+            add_ee_image(m, sar_vv_img, dynamic_sar_vis(sar_vv_img, AOI),
                          f"SAR VV {start_date}→{end_date}")
         except Exception as e:
             st.warning(f"SAR VV failed: {e}")
@@ -401,32 +435,45 @@ def build_map_and_layers():
     l.success(f"AOI area: {AOI_area_ha} ha" if AOI_area_ha is not None else "AOI area: n/a")
     r.info(f"🛰️ S2 scenes: {s2_count} • 📡 S1 scenes: {s1_count}")
 
-    return draw_ret, AOI, ndvi_img, ndwi_img, sar_vv_img, risk_img
+    return draw_ret, AOI, ndvi_img, ndwi_img, sar_vv_img, risk_img, s2_img
 
 # ─────────────────────────────────────────────────────────────────────
-# Read draw return (works across streamlit-folium versions)
+# Read draw return (prefer rectangles for AOI; points for sampling only)
 # ─────────────────────────────────────────────────────────────────────
-def parse_draw_geojson(draw_ret):
-    if not isinstance(draw_ret, dict):
+def _get_feat_geom(obj):
+    if not isinstance(obj, dict):
         return None
+    g = obj.get("geometry") or obj
+    if isinstance(g, dict) and g.get("type") == "Feature" and "geometry" in g:
+        g = g["geometry"]
+    return g if isinstance(g, dict) and "type" in g else None
+
+def parse_draw(draw_ret):
+    """Returns (new_aoi_polygon_or_None, sample_point_or_None)"""
+    if not isinstance(draw_ret, dict):
+        return (None, None)
+    # Prefer most recent polygon/rectangle as AOI
+    candidates = []
     for key in ("last_active_drawing", "last_drawing"):
-        obj = draw_ret.get(key)
-        if obj and isinstance(obj, dict):
-            geom = obj.get("geometry") or obj
-            if isinstance(geom, dict):
-                if geom.get("type") == "Feature" and "geometry" in geom:
-                    geom = geom["geometry"]
-                return geom
+        g = _get_feat_geom(draw_ret.get(key))
+        if g: candidates.append(g)
     all_draw = draw_ret.get("all_drawings")
-    if isinstance(all_draw, list) and len(all_draw) > 0:
-        cand = all_draw[-1]
-        if isinstance(cand, dict):
-            g = cand.get("geometry") or cand
-            if isinstance(g, dict):
-                if g.get("type") == "Feature" and "geometry" in g:
-                    g = g["geometry"]
-                return g
-    return None
+    if isinstance(all_draw, list):
+        for item in all_draw[-5:]:  # recent few
+            g = _get_feat_geom(item)
+            if g: candidates.append(g)
+    new_aoi = None
+    sample_pt = None
+    for g in reversed(candidates):  # newest first
+        t = g.get("type")
+        if t in ("Polygon", "MultiPolygon"):  # AOI from polygon only
+            new_aoi = g
+            break
+    for g in reversed(candidates):
+        if g.get("type") == "Point":
+            sample_pt = g
+            break
+    return (new_aoi, sample_pt)
 
 def geojson_equal(a, b):
     try:
@@ -437,45 +484,67 @@ def geojson_equal(a, b):
 # ─────────────────────────────────────────────────────────────────────
 # Build → render → capture draw → rerun if AOI changed
 # ─────────────────────────────────────────────────────────────────────
-draw_ret, AOI, ndvi_img, ndwi_img, sar_vv_img, risk_img = build_map_and_layers()
+draw_ret, AOI, ndvi_img, ndwi_img, sar_vv_img, risk_img, s2_img = build_map_and_layers()
 
-new_geom = parse_draw_geojson(draw_ret)
-if new_geom and not geojson_equal(new_geom, st.session_state["aoi_geojson"]):
-    st.session_state["aoi_geojson"] = new_geom
+new_aoi, sample_pt = parse_draw(draw_ret)
+if new_aoi and not geojson_equal(new_aoi, st.session_state["aoi_geojson"]):
+    st.session_state["aoi_geojson"] = new_aoi
     # Recenter to AOI centroid
     try:
         import ee
-        cen = ee.Geometry(new_geom).centroid(1).coordinates().getInfo()
+        cen = ee.Geometry(new_aoi).centroid(1).coordinates().getInfo()
         st.session_state["center"] = (float(cen[1]), float(cen[0]))
     except Exception:
         pass
     st.experimental_rerun()
 
 # ─────────────────────────────────────────────────────────────────────
-# Quick previews (prove data exists even if map tiles look cached)
+# Clean click-sample readout (no GeoJSON popup on map)
 # ─────────────────────────────────────────────────────────────────────
-with st.expander("Quick previews (NDVI / NDWI / SAR)"):
-    cols = st.columns(3)
-    if ndvi_img is not None:
-        try:
-            url = ndvi_img.getThumbURL({"region": AOI, "scale": 10, "min": 0, "max": 1,
-                                        "palette": ["#8b4513","#ffff00","#00ff00"]})
-            cols[0].image(url, caption="NDVI preview", use_column_width=True)
-        except Exception:
-            pass
-    if ndwi_img is not None:
-        try:
-            url = ndwi_img.getThumbURL({"region": AOI, "scale": 10, "min": -1, "max": 1,
-                                        "palette": ["#654321","#ffffff","#00bfff"]})
-            cols[1].image(url, caption="NDWI preview", use_column_width=True)
-        except Exception:
-            pass
-    if sar_vv_img is not None:
-        try:
-            url = sar_vv_img.getThumbURL({"region": AOI, "scale": 20, "min": -20, "max": -2})
-            cols[2].image(url, caption="SAR VV preview", use_column_width=True)
-        except Exception:
-            pass
+if sample_pt:
+    try:
+        import ee
+        coords = sample_pt.get("coordinates", None)
+        if isinstance(coords, (list, tuple)) and len(coords) == 2:
+            lon, lat = float(coords[0]), float(coords[1])
+            pt = ee.Geometry.Point([lon, lat])
+            # Sample available layers at the point
+            vals = {}
+            if ndvi_img is not None:
+                v = ndvi_img.sample(pt, 10).first().get("NDVI")
+                vals["NDVI"] = v
+            if ndwi_img is not None:
+                v = ndwi_img.sample(pt, 10).first().get("NDWI")
+                vals["NDWI"] = v
+            if sar_vv_img is not None:
+                v = sar_vv_img.sample(pt, 20).first().get("VV")
+                vals["SAR_VV"] = v
+            vinfo = {k: (None if vals[k] is None else ee.Number(vals[k]).getInfo()) for k in vals}
+            # Display simple, clean readout
+            st.info(
+                f"Point sample →  lat: **{lat:.6f}**, lon: **{lon:.6f}**  |  " +
+                "  •  ".join([f"{k}: {('n/a' if v is None else round(float(v), 3))}" for k, v in vinfo.items()])
+            )
+    except Exception as e:
+        st.warning(f"Point sampling failed: {e}")
+
+# ─────────────────────────────────────────────────────────────────────
+# Anchor for hash links and auto-scroll
+# ─────────────────────────────────────────────────────────────────────
+import streamlit.components.v1 as components
+st.markdown('<a name="aoi-summary"></a>', unsafe_allow_html=True)
+components.html("""
+<script>
+  const scrollToAnchor = () => {
+    const hash = window.location.hash;
+    if (hash === '#aoi-summary') {
+      const el = document.querySelector('a[name="aoi-summary"]');
+      if (el) { el.scrollIntoView({behavior:'smooth', block:'start'}); }
+    }
+  };
+  setTimeout(scrollToAnchor, 350);
+</script>
+""", height=0)
 
 # ─────────────────────────────────────────────────────────────────────
 # AOI Summary (NDVI stats, water %, erosion rating)
@@ -570,6 +639,32 @@ try:
         )
 except Exception as e:
     st.error(f"Time-series failed: {e}")
+
+# ─────────────────────────────────────────────────────────────────────
+# Quick previews (prove data exists even if map tiles look cached)
+# ─────────────────────────────────────────────────────────────────────
+with st.expander("Quick previews (NDVI / NDWI / SAR)"):
+    cols = st.columns(3)
+    if ndvi_img is not None:
+        try:
+            url = ndvi_img.getThumbURL({"region": AOI, "scale": 10, "min": 0, "max": 1,
+                                        "palette": ["#8b4513","#ffff00","#00ff00"]})
+            cols[0].image(url, caption="NDVI preview", use_column_width=True)
+        except Exception:
+            pass
+    if ndwi_img is not None:
+        try:
+            url = ndwi_img.getThumbURL({"region": AOI, "scale": 10, "min": -1, "max": 1,
+                                        "palette": ["#654321","#ffffff","#00bfff"]})
+            cols[1].image(url, caption="NDWI preview", use_column_width=True)
+        except Exception:
+            pass
+    if sar_vv_img is not None:
+        try:
+            url = sar_vv_img.getThumbURL({"region": AOI, "scale": 20, "min": -20, "max": -2})
+            cols[2].image(url, caption="SAR VV preview", use_column_width=True)
+        except Exception:
+            pass
 
 # ─────────────────────────────────────────────────────────────────────
 # Export NDVI
