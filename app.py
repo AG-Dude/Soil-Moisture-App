@@ -2,6 +2,7 @@ import os
 import sys
 import json
 import math
+import time
 from datetime import date, timedelta, datetime, timezone
 
 import streamlit as st
@@ -32,7 +33,6 @@ def ee_init():
         st.error("EE_PRIVATE_KEY is missing/empty. Add FULL service-account JSON in Render → Environment.")
         st.stop()
 
-    # remove accidental wrapping quotes
     if (key.startswith('"') and key.endswith('"')) or (key.startswith("'") and key.endswith("'")):
         key = key[1:-1].strip()
 
@@ -74,46 +74,25 @@ def ee_init():
 ee = ee_init()
 
 # ─────────────────────────────────────────────────────────────────────
-# Leafmap (folium backend) + robust EE layer add
+# Imports that depend on installed libs
 # ─────────────────────────────────────────────────────────────────────
 try:
-    import leafmap.foliumap as leafmap
+    # Use folium + streamlit-folium for robust event handling
+    import folium
+    from folium.plugins import Draw, Fullscreen, MousePosition
+    from streamlit_folium import st_folium
+except Exception as e:
+    st.error("Missing dependencies for map UI. Add to requirements.txt:\n"
+             "streamlit-folium==0.22.0\nfolium==0.16.0\n\nError: " + str(e))
+    st.stop()
+
+try:
+    # We still use leafmap just to build EE tile layers
+    import leafmap
+    import leafmap.foliumap as leafmap_f
 except Exception as e:
     st.error(f"Leafmap import failed: {e}. Pin leafmap==0.50.0.")
     st.stop()
-
-def add_ee_image(m, image, vis, name):
-    """Add an EE image to the map regardless of leafmap version."""
-    try:
-        m.add_ee_layer(image, vis, name)
-        return
-    except Exception:
-        pass
-    try:
-        tile = leafmap.ee_tile_layer(image, vis, name)
-        try:
-            m.add_layer(tile)
-        except Exception:
-            m.add_child(tile)
-    except Exception as e:
-        st.warning(f"Failed to add '{name}': {e}")
-
-def safe_to_streamlit(m, height=600):
-    """Render the map but swallow the StopException that can occur on rerun."""
-    try:
-        ret = m.to_streamlit(height=height)
-        return ret if ret is not None else {}
-    except Exception as e:
-        if "StopException" in repr(e) or "StopException" in str(e):
-            st.stop()
-        try:
-            ret = m.to_streamlit(height=height)
-            return ret if ret is not None else {}
-        except Exception as e2:
-            if "StopException" in repr(e2) or "StopException" in str(e2):
-                st.stop()
-            st.error(f"Map render failed: {e2}")
-            return {}
 
 # ─────────────────────────────────────────────────────────────────────
 # Session state defaults
@@ -131,7 +110,7 @@ def default_aoi_box(center_lat, center_lon, half_m=400):
         [center_lon + lon_deg, center_lat - lat_deg],
         [center_lon - lon_deg, center_lat - lat_deg],
     ]
-    return {"type": "Polygon", "coordinates": [coords]}
+    return {"type": "Polygon", "coordinates": [coords + [coords[0]]]}
 
 if "center" not in st.session_state:
     st.session_state["center"] = default_center()
@@ -140,7 +119,7 @@ if "aoi_geojson" not in st.session_state:
     st.session_state["aoi_geojson"] = default_aoi_box(clat, clon, half_m=400)
 
 # ─────────────────────────────────────────────────────────────────────
-# Address search + AOI box selection
+# Top controls: address search + AOI size
 # ─────────────────────────────────────────────────────────────────────
 st.subheader("Find a place & create AOI box")
 c1, c2, c3 = st.columns([4, 2, 1])
@@ -193,6 +172,8 @@ with st.sidebar:
     st.divider()
     if st.button("Force refresh tiles & cache"):
         st.cache_data.clear()
+        # also bump a cache-buster
+        st.session_state["cachebust"] = int(time.time())
         st.experimental_rerun()
 
     st.divider()
@@ -295,43 +276,45 @@ def dynamic_sar_vis(img, geom):
     return {"min": vmin, "max": vmax, "opacity": 0.75}
 
 # ─────────────────────────────────────────────────────────────────────
-# Map + layers
+# Build folium map with overlays and draw tools
 # ─────────────────────────────────────────────────────────────────────
+def ee_tilelayer(image, vis, name):
+    """Get a folium TileLayer for an EE image, with a cache-buster to avoid stale tiles."""
+    t = int(time.time())  # cache-bust per rerun
+    layer = leafmap_f.ee_tile_layer(image, vis, f"{name} {t}")
+    return layer
+
 def build_map_and_layers():
     AOI = ee_aoi()
     clat, clon = st.session_state["center"]
 
-    # Disable lat/lon popup so clicks don't show raw GeoJSON
-    try:
-        m = leafmap.Map(center=[clat, clon], zoom=14, latlon_control=False)
-    except TypeError:
-        # Fallback if leafmap doesn't accept latlon_control kwarg
-        m = leafmap.Map(center=[clat, clon], zoom=14)
-        try:
-            # Turn off default popup if method exists
-            if hasattr(m, "add_latlon_popup"):
-                pass  # don't add it
-        except Exception:
-            pass
+    # Base map
+    fmap = folium.Map(location=[clat, clon], zoom_start=14, tiles=None, control_scale=True, prefer_canvas=True)
+    # Hybrid base
+    folium.TileLayer(tiles="https://{s}.google.com/vt/lyrs=s,h&x={x}&y={y}&z={z}",
+                     attr="Google Hybrid", name="HYBRID", overlay=False, control=True,
+                     subdomains=['mt0','mt1','mt2','mt3']).add_to(fmap)
 
-    m.add_basemap("HYBRID")
+    Fullscreen().add_to(fmap)
 
-    # Drawing: allow rectangle (AOI) and point (sampling) only
-    try:
-        m.add_draw_control(
-            draw_marker=True,   # point sampling (does NOT change AOI)
-            draw_circle=False, draw_circlemarker=False,
-            draw_polyline=False, draw_rectangle=True, draw_polygon=False,
-            edit=True, remove=True
-        )
-    except Exception:
-        pass
+    # Draw tools: rectangle (AOI) + marker (sampling). Disable polygon freehand to avoid accidental AOI changes.
+    Draw(
+        draw_options={
+            "polyline": False,
+            "polygon": False,
+            "circle": False,
+            "circlemarker": False,
+            "rectangle": True,
+            "marker": True,
+        },
+        edit_options={"edit": True, "remove": True}
+    ).add_to(fmap)
 
-    # AOI outline
+    # AOI outline (cyan)
     try:
         import ee
         aoi_outline = ee.Image().byte().paint(AOI, 1, 2).visualize(palette=["#00FFFF"])
-        add_ee_image(m, aoi_outline, {}, "AOI outline")
+        ee_tilelayer(aoi_outline, {}, "AOI outline").add_to(fmap)
     except Exception:
         pass
 
@@ -362,9 +345,11 @@ def build_map_and_layers():
     if s2_img is not None and show_ndvi:
         try:
             ndvi_img = s2_img.normalizedDifference(["B8", "B4"]).rename("NDVI")
-            add_ee_image(m, ndvi_img, {"min": 0, "max": 1,
-                                       "palette": ["#8b4513","#ffff00","#00ff00"], "opacity": 0.8},
-                         f"NDVI {start_date}→{end_date}")
+            ee_tilelayer(
+                ndvi_img,
+                {"min": 0, "max": 1, "palette": ["#8b4513","#ffff00","#00ff00"], "opacity": 0.8},
+                f"NDVI {start_date}→{end_date}"
+            ).add_to(fmap)
         except Exception as e:
             st.warning(f"NDVI layer failed: {e}")
 
@@ -372,20 +357,23 @@ def build_map_and_layers():
         try:
             ndwi_img = s2_img.normalizedDifference(["B3", "B8"]).rename("NDWI")
             if show_ndwi:
-                add_ee_image(m, ndwi_img, {"min": -1, "max": 1,
-                                           "palette": ["#654321","#ffffff","#00bfff"], "opacity": 0.7},
-                             f"NDWI {start_date}→{end_date}")
+                ee_tilelayer(
+                    ndwi_img,
+                    {"min": -1, "max": 1, "palette": ["#654321","#ffffff","#00bfff"], "opacity": 0.7},
+                    f"NDWI {start_date}→{end_date}"
+                ).add_to(fmap)
             if show_water:
                 water = ndwi_img.gt(0.2).selfMask()
-                add_ee_image(m, water, {"palette": ["#00aaff"], "opacity": 0.9}, "Water mask (NDWI>0.2)")
+                ee_tilelayer(water, {"palette": ["#00aaff"], "opacity": 0.9}, "Water mask (NDWI>0.2)").add_to(fmap)
         except Exception as e:
             st.warning(f"NDWI/Water layer failed: {e}")
 
     if show_sar_vv and s1_count > 0:
         try:
             sar_vv_img = s1_mean_vv(AOI, str(start_date), str(end_date))
-            add_ee_image(m, sar_vv_img, dynamic_sar_vis(sar_vv_img, AOI),
-                         f"SAR VV {start_date}→{end_date}")
+            ee_tilelayer(
+                sar_vv_img, dynamic_sar_vis(sar_vv_img, AOI), f"SAR VV {start_date}→{end_date}"
+            ).add_to(fmap)
         except Exception as e:
             st.warning(f"SAR VV failed: {e}")
 
@@ -396,33 +384,35 @@ def build_map_and_layers():
                 palette12 = ["#fef0d9","#fdcc8a","#fc8d59","#e34a33","#b30000",
                              "#31a354","#2b8cbe","#a6bddb","#1c9099","#c7e9b4",
                              "#7fcdbb","#df65b0"]
-                add_ee_image(m, tex, {"min": 1, "max": 12, "palette": palette12, "opacity": 0.7},
-                             "Soil texture (USDA 12)")
+                ee_tilelayer(tex, {"min": 1, "max": 12, "palette": palette12, "opacity": 0.7},
+                             "Soil texture (USDA 12)").add_to(fmap)
             if show_soil_boundaries:
                 edges = soil_texture_edges(tex)
-                add_ee_image(m, edges, {"palette": ["#ff00ff"], "opacity": 0.9}, "Soil boundaries")
+                ee_tilelayer(edges, {"palette": ["#ff00ff"], "opacity": 0.9}, "Soil boundaries").add_to(fmap)
         except Exception as e:
             st.warning(f"Soil layers failed: {e}")
 
-    if show_erosion and (ndvi_img is not None):
+    if show_erosion and s2_img is not None:
         try:
-            risk_img = erosion_risk_layer(AOI, ndvi_img)
-            vis = {"min": 0, "max": 1, "palette": ["#ffffb2","#fecc5c","#fd8d3c","#f03b20","#bd0026"], "opacity": 0.85}
-            add_ee_image(m, risk_img, vis, "Erosion risk (relative)")
+            risk_img = erosion_risk_layer(AOI, s2_img.normalizedDifference(["B8", "B4"]).rename("NDVI"))
+            ee_tilelayer(
+                risk_img, {"min": 0, "max": 1,
+                           "palette": ["#ffffb2","#fecc5c","#fd8d3c","#f03b20","#bd0026"], "opacity": 0.85},
+                "Erosion risk (relative)"
+            ).add_to(fmap)
         except Exception as e:
             st.warning(f"Erosion risk failed: {e}")
 
-    # Layer control
-    try:
-        m.add_layer_control()
-    except Exception:
-        try:
-            m.add_layers_control()
-        except Exception:
-            pass
+    folium.LayerControl(collapsed=False).add_to(fmap)
 
-    # Render map (safe) & compute status
-    draw_ret = safe_to_streamlit(m, height=600)
+    # Render via streamlit-folium (robust events)
+    out = st_folium(
+        fmap,
+        width=None,
+        height=600,
+        returned_objects=["last_active_drawing", "all_drawings", "last_drawn_feature", "last_clicked"],
+        key=f"map_{int(time.time())}"  # bust streamlit widget cache per rerun so layers refresh
+    )
 
     # Status bar
     try:
@@ -435,45 +425,49 @@ def build_map_and_layers():
     l.success(f"AOI area: {AOI_area_ha} ha" if AOI_area_ha is not None else "AOI area: n/a")
     r.info(f"🛰️ S2 scenes: {s2_count} • 📡 S1 scenes: {s1_count}")
 
-    return draw_ret, AOI, ndvi_img, ndwi_img, sar_vv_img, risk_img, s2_img
+    return out, AOI, ndvi_img, ndwi_img, sar_vv_img, risk_img, s2_img
 
 # ─────────────────────────────────────────────────────────────────────
-# Read draw return (prefer rectangles for AOI; points for sampling only)
+# Parse draw output: rectangle → AOI, marker → sample point
 # ─────────────────────────────────────────────────────────────────────
-def _get_feat_geom(obj):
-    if not isinstance(obj, dict):
+def _get_geom_from_feature(feat):
+    if not isinstance(feat, dict):
         return None
-    g = obj.get("geometry") or obj
-    if isinstance(g, dict) and g.get("type") == "Feature" and "geometry" in g:
-        g = g["geometry"]
-    return g if isinstance(g, dict) and "type" in g else None
+    if feat.get("type") == "Feature":
+        geom = feat.get("geometry")
+        return geom if isinstance(geom, dict) else None
+    return feat if isinstance(feat, dict) and "type" in feat else None
 
-def parse_draw(draw_ret):
+def extract_draw(out):
     """Returns (new_aoi_polygon_or_None, sample_point_or_None)"""
-    if not isinstance(draw_ret, dict):
-        return (None, None)
-    # Prefer most recent polygon/rectangle as AOI
-    candidates = []
-    for key in ("last_active_drawing", "last_drawing"):
-        g = _get_feat_geom(draw_ret.get(key))
-        if g: candidates.append(g)
-    all_draw = draw_ret.get("all_drawings")
-    if isinstance(all_draw, list):
-        for item in all_draw[-5:]:  # recent few
-            g = _get_feat_geom(item)
-            if g: candidates.append(g)
     new_aoi = None
     sample_pt = None
-    for g in reversed(candidates):  # newest first
-        t = g.get("type")
-        if t in ("Polygon", "MultiPolygon"):  # AOI from polygon only
-            new_aoi = g
-            break
-    for g in reversed(candidates):
-        if g.get("type") == "Point":
-            sample_pt = g
-            break
-    return (new_aoi, sample_pt)
+
+    # Prefer explicit last_drawn_feature
+    for key in ("last_drawn_feature", "last_active_drawing"):
+        geom = _get_geom_from_feature(out.get(key)) if isinstance(out, dict) else None
+        if geom:
+            t = geom.get("type")
+            if t in ("Polygon", "MultiPolygon"):
+                new_aoi = geom
+                break
+            if t == "Point":
+                sample_pt = geom
+
+    # Scan all_drawings for newest
+    if isinstance(out, dict):
+        all_drawings = out.get("all_drawings") or []
+        for feat in reversed(all_drawings[-5:]):
+            geom = _get_geom_from_feature(feat)
+            if not geom:
+                continue
+            t = geom.get("type")
+            if t in ("Polygon", "MultiPolygon") and new_aoi is None:
+                new_aoi = geom
+            if t == "Point" and sample_pt is None:
+                sample_pt = geom
+
+    return new_aoi, sample_pt
 
 def geojson_equal(a, b):
     try:
@@ -484,9 +478,9 @@ def geojson_equal(a, b):
 # ─────────────────────────────────────────────────────────────────────
 # Build → render → capture draw → rerun if AOI changed
 # ─────────────────────────────────────────────────────────────────────
-draw_ret, AOI, ndvi_img, ndwi_img, sar_vv_img, risk_img, s2_img = build_map_and_layers()
+draw_out, AOI, ndvi_img, ndwi_img, sar_vv_img, risk_img, s2_img = build_map_and_layers()
 
-new_aoi, sample_pt = parse_draw(draw_ret)
+new_aoi, sample_pt = extract_draw(draw_out or {})
 if new_aoi and not geojson_equal(new_aoi, st.session_state["aoi_geojson"]):
     st.session_state["aoi_geojson"] = new_aoi
     # Recenter to AOI centroid
@@ -499,7 +493,7 @@ if new_aoi and not geojson_equal(new_aoi, st.session_state["aoi_geojson"]):
     st.experimental_rerun()
 
 # ─────────────────────────────────────────────────────────────────────
-# Clean click-sample readout (no GeoJSON popup on map)
+# Clean click-sample readout (no raw GeoJSON popup)
 # ─────────────────────────────────────────────────────────────────────
 if sample_pt:
     try:
@@ -508,19 +502,14 @@ if sample_pt:
         if isinstance(coords, (list, tuple)) and len(coords) == 2:
             lon, lat = float(coords[0]), float(coords[1])
             pt = ee.Geometry.Point([lon, lat])
-            # Sample available layers at the point
             vals = {}
             if ndvi_img is not None:
-                v = ndvi_img.sample(pt, 10).first().get("NDVI")
-                vals["NDVI"] = v
+                v = ndvi_img.sample(pt, 10).first().get("NDVI"); vals["NDVI"] = v
             if ndwi_img is not None:
-                v = ndwi_img.sample(pt, 10).first().get("NDWI")
-                vals["NDWI"] = v
+                v = ndwi_img.sample(pt, 10).first().get("NDWI"); vals["NDWI"] = v
             if sar_vv_img is not None:
-                v = sar_vv_img.sample(pt, 20).first().get("VV")
-                vals["SAR_VV"] = v
+                v = sar_vv_img.sample(pt, 20).first().get("VV"); vals["SAR_VV"] = v
             vinfo = {k: (None if vals[k] is None else ee.Number(vals[k]).getInfo()) for k in vals}
-            # Display simple, clean readout
             st.info(
                 f"Point sample →  lat: **{lat:.6f}**, lon: **{lon:.6f}**  |  " +
                 "  •  ".join([f"{k}: {('n/a' if v is None else round(float(v), 3))}" for k, v in vinfo.items()])
@@ -552,9 +541,10 @@ components.html("""
 st.subheader("AOI summary")
 rows = []
 
-if ndvi_img is not None:
+if s2_img is not None:
+    ndvi_for_stats = s2_img.normalizedDifference(["B8", "B4"]).rename("NDVI")
     try:
-        vals = reduce_stats(ndvi_img, AOI, scale=10).getInfo()
+        vals = reduce_stats(ndvi_for_stats, AOI, scale=10).getInfo()
     except Exception:
         vals = None
     if vals:
@@ -566,15 +556,20 @@ if ndvi_img is not None:
             ["P90 NDVI", round(float(vals.get("NDVI_p90", float("nan"))), 3)],
         ])
 
-if ndwi_img is not None and show_water:
-    wp = compute_water_pct(ndwi_img, AOI, thresh=0.2, scale=10)
-    if wp is not None:
-        rows.append(["Water % (NDWI>0.2)", wp])
-
-if risk_img is not None:
+if s2_img is not None and show_water:
     try:
+        ndwi_tmp = s2_img.normalizedDifference(["B3", "B8"]).rename("NDWI")
+        wp = compute_water_pct(ndwi_tmp, AOI, thresh=0.2, scale=10)
+        if wp is not None:
+            rows.append(["Water % (NDWI>0.2)", wp])
+    except Exception:
+        pass
+
+if s2_img is not None and show_erosion:
+    try:
+        risk_tmp = erosion_risk_layer(AOI, s2_img.normalizedDifference(["B8", "B4"]).rename("NDVI"))
         import ee
-        mean_risk = risk_img.reduceRegion(ee.Reducer.mean(), AOI, 30, bestEffort=True).getInfo().get("risk", None)
+        mean_risk = risk_tmp.reduceRegion(ee.Reducer.mean(), AOI, 30, bestEffort=True).getInfo().get("risk", None)
         if mean_risk is not None:
             rating = "Low"
             if mean_risk >= 0.66:
@@ -589,7 +584,7 @@ if risk_img is not None:
 if rows:
     st.table(pd.DataFrame(rows, columns=["Metric", "Value"]))
 else:
-    st.info("Turn on NDVI/NDWI and set an AOI to see summary metrics.")
+    st.info("Turn on the overlays and set an AOI to see summary metrics.")
 
 # ─────────────────────────────────────────────────────────────────────
 # NDVI time-series + citation  (CACHE FIX: underscore param)
@@ -619,7 +614,8 @@ def compute_ndvi_timeseries(_aoi_geom, start_str, end_str, cloud_max, limit_n=20
 
 st.subheader("NDVI time-series")
 try:
-    ts_df = compute_ndvi_timeseries(AOI, str(start_date), str(end_date), cloud_thresh, 20)
+    AOI_geom = ee_aoi()
+    ts_df = compute_ndvi_timeseries(AOI_geom, str(start_date), str(end_date), cloud_thresh, 20)
     if ts_df.empty:
         st.info("No valid NDVI samples in this window. Try broadening the date range or raising cloud %.")
     else:
@@ -645,17 +641,18 @@ except Exception as e:
 # ─────────────────────────────────────────────────────────────────────
 with st.expander("Quick previews (NDVI / NDWI / SAR)"):
     cols = st.columns(3)
-    if ndvi_img is not None:
+    if s2_img is not None:
         try:
-            url = ndvi_img.getThumbURL({"region": AOI, "scale": 10, "min": 0, "max": 1,
-                                        "palette": ["#8b4513","#ffff00","#00ff00"]})
+            ndvi_prev = s2_img.normalizedDifference(["B8", "B4"]).rename("NDVI")
+            url = ndvi_prev.getThumbURL({"region": AOI, "scale": 10, "min": 0, "max": 1,
+                                         "palette": ["#8b4513","#ffff00","#00ff00"]})
             cols[0].image(url, caption="NDVI preview", use_column_width=True)
         except Exception:
             pass
-    if ndwi_img is not None:
         try:
-            url = ndwi_img.getThumbURL({"region": AOI, "scale": 10, "min": -1, "max": 1,
-                                        "palette": ["#654321","#ffffff","#00bfff"]})
+            ndwi_prev = s2_img.normalizedDifference(["B3", "B8"]).rename("NDWI")
+            url = ndwi_prev.getThumbURL({"region": AOI, "scale": 10, "min": -1, "max": 1,
+                                         "palette": ["#654321","#ffffff","#00bfff"]})
             cols[1].image(url, caption="NDWI preview", use_column_width=True)
         except Exception:
             pass
@@ -670,13 +667,13 @@ with st.expander("Quick previews (NDVI / NDWI / SAR)"):
 # Export NDVI
 # ─────────────────────────────────────────────────────────────────────
 st.markdown("### Export")
-if ndvi_img is not None and st.button("Generate NDVI GeoTIFF URL"):
+if s2_img is not None and st.button("Generate NDVI GeoTIFF URL"):
     try:
-        ndvi_scaled = ndvi_img.toFloat().multiply(10000).toInt16()
+        ndvi_scaled = s2_img.normalizedDifference(["B8", "B4"]).rename("NDVI").toFloat().multiply(10000).toInt16()
         url = ndvi_scaled.getDownloadURL({"scale": 10, "region": AOI, "crs": "EPSG:4326", "format": "GEO_TIFF"})
         st.success("NDVI GeoTIFF URL ready:")
         st.write(f"[Download NDVI (GeoTIFF)]({url})")
     except Exception as e:
         st.error(f"Export failed: {e}")
 
-# NOTE: AI helper intentionally removed (was causing 'Client.init(...proxies)' errors).
+# NOTE: AI helper intentionally removed (previous errors); can be added back later if needed.
